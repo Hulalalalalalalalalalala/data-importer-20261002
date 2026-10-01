@@ -12,20 +12,36 @@ def normalize_csv(source, schema):
         raise ValueError("schema column names must be nonempty and unique")
     if any(column["type"] not in ("string", "integer", "boolean") for column in columns):
         raise ValueError("unsupported column type")
+    sources = []
+    for column in columns:
+        name = column["name"]
+        if "source" not in column:
+            sources.append(name)
+            continue
+        origin = column["source"]
+        if not isinstance(origin, str) or not origin.strip():
+            raise ValueError(f"column {name!r}: source must be a non-empty, non-blank string")
+        sources.append(origin)
+    owners = {}
+    for column, origin in zip(columns, sources):
+        name = column["name"]
+        if origin in owners:
+            raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
+        owners[origin] = name
     records, errors = [], []
     with Path(source).open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        if reader.fieldnames != names:
-            raise ValueError("CSV header must match schema column order exactly")
+        if reader.fieldnames != sources:
+            raise ValueError("CSV header must match schema column sources and order exactly")
         for row_number, row in enumerate(reader, start=2):
             record = {}
             row_errors = []
             if None in row or any(value is None for value in row.values()):
                 row_errors.append("wrong number of cells")
             else:
-                for column in columns:
+                for column, origin in zip(columns, sources):
                     name, kind = column["name"], column["type"]
-                    value = row[name].strip()
+                    value = row[origin].strip()
                     try:
                         if not value:
                             if column.get("required", False):
