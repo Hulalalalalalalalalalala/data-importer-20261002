@@ -1,0 +1,11 @@
+Install
+python3 --version
+Python 3.10 or newer; standard library only.
+
+Start
+python3 data_importer.py samples/customers.csv --schema samples/schema.json --output customers.jsonl --errors errors.jsonl
+Prints accepted 2 and rejected 0; writes two JSONL rows.
+
+Smoke Test
+python3 -B -m unittest -v
+Checks typed conversion, rejected rows, bad configuration and CLI output.
