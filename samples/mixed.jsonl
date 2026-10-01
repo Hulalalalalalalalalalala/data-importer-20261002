@@ -1,0 +1,4 @@
+{"name": "Maya", "orders": 3, "active": true}
+
+{"name": "Omar", "orders": "many", "active": true}
+{"name": null, "orders": 4, "active": "yes"}
