@@ -5,27 +5,50 @@ import json
 from pathlib import Path
 
 
-def normalize_csv(source, schema):
-    columns = schema["columns"]
+def _resolve_columns(columns):
     names = [column["name"] for column in columns]
     if not names or len(set(names)) != len(names):
         raise ValueError("schema column names must be nonempty and unique")
     if any(column["type"] not in ("string", "integer", "boolean") for column in columns):
         raise ValueError("unsupported column type")
+    sources = []
+    for column in columns:
+        name = column["name"]
+        if "source" in column:
+            source = column["source"]
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError(f"column '{name}': source must be a nonempty string")
+        else:
+            source = name
+        sources.append(source)
+    source_owners = {}
+    for name, source in zip(names, sources):
+        if source in source_owners:
+            raise ValueError(
+                f"source '{source}' is used by multiple columns: "
+                f"'{source_owners[source]}' and '{name}'"
+            )
+        source_owners[source] = name
+    return names, sources
+
+
+def normalize_csv(source, schema):
+    columns = schema["columns"]
+    names, sources = _resolve_columns(columns)
     records, errors = [], []
     with Path(source).open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        if reader.fieldnames != names:
-            raise ValueError("CSV header must match schema column order exactly")
+        if reader.fieldnames != sources:
+            raise ValueError("CSV header must match schema column sources and order exactly")
         for row_number, row in enumerate(reader, start=2):
             record = {}
             row_errors = []
             if None in row or any(value is None for value in row.values()):
                 row_errors.append("wrong number of cells")
             else:
-                for column in columns:
+                for column, csv_name in zip(columns, sources):
                     name, kind = column["name"], column["type"]
-                    value = row[name].strip()
+                    value = row[csv_name].strip()
                     try:
                         if not value:
                             if column.get("required", False):

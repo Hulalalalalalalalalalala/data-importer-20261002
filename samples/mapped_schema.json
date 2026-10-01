@@ -1,0 +1,1 @@
+{"columns":[{"name":"name","type":"string","required":true,"source":"display_name"},{"name":"orders","type":"integer","source":"purchase_count"},{"name":"active","type":"boolean","required":true}]}
