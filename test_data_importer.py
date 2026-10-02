@@ -2515,6 +2515,335 @@ class LteFieldRelationTests(unittest.TestCase):
                 self.assertFalse(errors.exists())
 
 
+class DeduplicateByTests(unittest.TestCase):
+    """Optional keep-first deduplication over final converted values."""
+
+    MISSING = {"csv": ROOT / "samples" / "does-not-exist.csv",
+               "jsonl": ROOT / "samples" / "does-not-exist.jsonl"}
+
+    def schema(self, **overrides):
+        columns = [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "required": True},
+            {"name": "active", "type": "boolean", "required": True},
+        ]
+        return {"columns": columns}
+
+    def write_source(self, directory, text, fmt):
+        path = Path(directory) / ("data.csv" if fmt == "csv" else "data.jsonl")
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def normalize(self, path, schema, fmt, **kwargs):
+        return (normalize_csv if fmt == "csv" else normalize_jsonl)(path, schema, **kwargs)
+
+    # name/orders after conversion, plus one illegal orders row at the end
+    ROWS = {
+        "csv": ("name,orders,active\n"
+                "A,3,true\n"
+                "A,3,true\n"
+                "B,3,true\n"
+                "A,4,true\n"
+                "B,3,true\n"
+                "C,bad,true\n"),
+        "jsonl": ('{"name": "A", "orders": 3, "active": true}\n'
+                  '{"name": "A", "orders": "3", "active": true}\n'
+                  '{"name": "B", "orders": 3, "active": true}\n'
+                  '{"name": "A", "orders": 4, "active": true}\n'
+                  '{"name": "B", "orders": 3, "active": true}\n'
+                  '{"name": "C", "orders": "bad", "active": true}\n'),
+    }
+
+    def test_equivalent_samples_keep_first_with_same_records_and_counts(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.ROWS[fmt], fmt)
+                result = self.normalize(path, self.schema(), fmt,
+                                        deduplicate_by=["name", "orders"])
+            self.assertEqual((result["accepted"], result["deduplicated"],
+                              result["rejected"]), (3, 2, 1), fmt)
+            self.assertEqual(result["records"], [
+                {"name": "A", "orders": 3, "active": True},
+                {"name": "B", "orders": 3, "active": True},
+                {"name": "A", "orders": 4, "active": True},
+            ], fmt)
+            self.assertNotIn("filtered", result)
+            self.assertNotIn("duplicates", result)
+            # the illegal row reaches errors once, at its physical line,
+            # never masked by filtering or deduplication
+            self.assertEqual(len(result["errors"]), 1)
+            self.assertEqual(result["errors"][0]["row"], 7 if fmt == "csv" else 6)
+            self.assertTrue(any("orders" in m for m in result["errors"][0]["errors"]))
+
+    def test_first_record_kept_whole_and_order_preserved(self):
+        # equal key, different non-key field: the first full record wins
+        # and nothing is merged or overwritten; survivors stay in order
+        texts = {
+            "csv": ("name,orders,active\n"
+                    "A,3,true\n"
+                    "A,4,false\n"
+                    "B,1,true\n"),
+            "jsonl": ('{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "A", "orders": 4, "active": false}\n'
+                      '{"name": "B", "orders": 1, "active": true}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(path, self.schema(), fmt,
+                                        deduplicate_by=["name"])
+            self.assertEqual((result["accepted"], result["deduplicated"],
+                              result["rejected"]), (2, 1, 0), fmt)
+            self.assertEqual(result["records"], [
+                {"name": "A", "orders": 3, "active": True},
+                {"name": "B", "orders": 1, "active": True},
+            ], fmt)
+
+    def test_composite_key_needs_every_field_equal(self):
+        texts = {
+            "csv": ("name,orders,active\nA,3,true\nA,4,true\nB,3,true\nA,3,false\n"),
+            "jsonl": ('{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "A", "orders": 4, "active": true}\n'
+                      '{"name": "B", "orders": 3, "active": true}\n'
+                      '{"name": "A", "orders": 3, "active": false}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(path, self.schema(), fmt,
+                                        deduplicate_by=["name", "orders"])
+            # only the first row has a full-key duplicate
+            self.assertEqual((result["accepted"], result["deduplicated"]), (3, 1), fmt)
+            self.assertEqual([r["name"] for r in result["records"]], ["A", "A", "B"], fmt)
+
+    def test_null_matches_null_and_strings_are_case_sensitive(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string"},
+            {"name": "orders", "type": "integer"},
+        ]}
+        texts = {
+            "csv": ("name,orders\nX,1\nx,2\n,3\n,4\n"),
+            "jsonl": ('{"name": "X", "orders": 1}\n'
+                      '{"name": "x", "orders": 2}\n'
+                      '{"name": null, "orders": 3}\n'
+                      '{"name": null, "orders": 4}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(path, schema, fmt,
+                                        deduplicate_by=["name"])
+            self.assertEqual(result["records"], [
+                {"name": "X", "orders": 1},
+                {"name": "x", "orders": 2},
+                {"name": None, "orders": 3},
+            ], fmt)
+            self.assertEqual(result["deduplicated"], 1, fmt)
+
+    def test_no_duplicates_reports_zero_and_keeps_everything(self):
+        texts = {
+            "csv": "name,orders,active\nA,1,true\nB,2,false\n",
+            "jsonl": ('{"name": "A", "orders": 1, "active": true}\n'
+                      '{"name": "B", "orders": 2, "active": false}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(path, self.schema(), fmt,
+                                        deduplicate_by=["name"])
+            self.assertEqual(result["accepted"], 2)
+            self.assertEqual(result["deduplicated"], 0)
+
+    def test_omitted_or_none_leaves_result_unchanged(self):
+        texts = {
+            "csv": "name,orders,active\nA,3,true\nA,3,false\n",
+            "jsonl": ('{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "A", "orders": 3, "active": false}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                omitted = self.normalize(path, self.schema(), fmt)
+                explicit_none = self.normalize(path, self.schema(), fmt,
+                                               deduplicate_by=None)
+            self.assertEqual(omitted, explicit_none)
+            self.assertEqual(set(omitted), {"records", "errors", "accepted", "rejected"})
+            self.assertNotIn("deduplicated", omitted)
+
+    def test_filter_runs_before_dedup_and_counts_stay_separate(self):
+        # valid rows: A3t, A3f, A3t, B1f -- filtering active=true keeps
+        # the first and third (identical), which dedup then collapses;
+        # filtered counts only the predicate removals (2), dedup only 1.
+        texts = {
+            "csv": ("name,orders,active\n"
+                    "A,3,true\nA,3,false\nA,3,true\nB,1,false\n"),
+            "jsonl": ('{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "A", "orders": 3, "active": false}\n'
+                      '{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "B", "orders": 1, "active": false}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(
+                    path, self.schema(), fmt,
+                    deduplicate_by=["name", "orders"],
+                    filter_eq={"field": "active", "value": True})
+            self.assertEqual((result["accepted"], result["filtered"],
+                              result["deduplicated"], result["rejected"]),
+                             (1, 2, 1, 0), fmt)
+            self.assertEqual(result["records"],
+                             [{"name": "A", "orders": 3, "active": True}], fmt)
+
+    def test_empty_result_after_filter_has_zero_deduplicated(self):
+        texts = {
+            "csv": "name,orders,active\nA,3,true\nA,3,true\n",
+            "jsonl": ('{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "A", "orders": 3, "active": true}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(
+                    path, self.schema(), fmt, deduplicate_by=["name", "orders"],
+                    filter_eq={"field": "name", "value": "zzz"})
+            self.assertEqual((result["accepted"], result["filtered"],
+                              result["deduplicated"]), (0, 2, 0), fmt)
+            self.assertEqual(result["records"], [])
+
+    def test_duplicate_report_runs_over_final_records(self):
+        texts = {
+            "csv": ("name,orders,active\n"
+                    "A,3,true\nB,3,true\nA,3,false\nA,4,true\n"),
+            "jsonl": ('{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "B", "orders": 3, "active": true}\n'
+                      '{"name": "A", "orders": 3, "active": false}\n'
+                      '{"name": "A", "orders": 4, "active": true}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(path, self.schema(), fmt,
+                                        deduplicate_by=["name", "orders"],
+                                        duplicate_by=["orders"])
+            self.assertEqual((result["accepted"], result["deduplicated"]), (3, 1), fmt)
+            # positions restart at 1 in the final, deduplicated records
+            self.assertEqual(result["duplicates"],
+                             [{"key": {"orders": 3}, "record_numbers": [1, 2]}], fmt)
+
+    def test_invalid_rows_are_not_deduplicated_or_masked(self):
+        texts = {
+            "csv": ("name,orders,active\n"
+                    "A,3,true\nA,3,true\nBad,x,true\nA,3,true\n"),
+            "jsonl": ('{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "A", "orders": 3, "active": true}\n'
+                      '{"name": "Bad", "orders": "x", "active": true}\n'
+                      '{"name": "A", "orders": 3, "active": true}\n'),
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(path, self.schema(), fmt,
+                                        deduplicate_by=["name", "orders"])
+            self.assertEqual((result["accepted"], result["deduplicated"],
+                              result["rejected"]), (1, 2, 1), fmt)
+            self.assertEqual(result["records"],
+                             [{"name": "A", "orders": 3, "active": True}], fmt)
+            self.assertEqual(result["errors"][0]["row"], 4 if fmt == "csv" else 3)
+
+    def test_invalid_config_raises_before_reading(self):
+        import copy
+        cases = ["orders", [], ["orders", "orders"], [""], ["  "], [3],
+                 ("orders",), ["nope"], ["active", "nope"]]
+        for fmt in ("csv", "jsonl"):
+            normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+            for value in cases:
+                with self.subTest(fmt=fmt, value=value):
+                    with self.assertRaises(ValueError) as caught:
+                        normalize(self.MISSING[fmt], self.schema(),
+                                  deduplicate_by=value)
+                    message = str(caught.exception)
+                    self.assertIn("deduplicate_by", message)
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(self.MISSING["csv"], self.schema(),
+                          deduplicate_by=["orders", "nope"])
+        self.assertIn("nope", str(caught.exception))
+        # a source alias is not accepted as a field name
+        mapped = {"columns": [
+            {"name": "name", "type": "string", "required": True, "source": "display_name"},
+            {"name": "orders", "type": "integer", "source": "purchase_count"},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_source(
+                directory, "display_name,purchase_count,active\nMaya,3,TRUE\n", "csv")
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(csv_path, mapped, deduplicate_by=["purchase_count"])
+            self.assertIn("deduplicate_by", str(caught.exception))
+        # the caller's list and schema are never mutated
+        fields = ["orders", "name"]
+        snapshot = copy.deepcopy(fields)
+        schema = self.schema()
+        schema_snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(
+                directory, self.ROWS["csv"], "csv")
+            normalize_csv(path, schema, deduplicate_by=fields)
+        self.assertEqual(fields, snapshot)
+        self.assertEqual(schema, schema_snapshot)
+
+    def test_cli_flag_summary_outputs_and_exit_code(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.ROWS[fmt], fmt)
+                output, errors = Path(directory) / "out.jsonl", Path(directory) / "errors.jsonl"
+                run = run_cli(path, output, errors, fmt=fmt,
+                              extra=("--deduplicate-by", "name",
+                                     "--deduplicate-by", "orders"))
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(json.loads(run.stdout),
+                                 {"accepted": 3, "rejected": 1, "deduplicated": 2})
+                records = [json.loads(line) for line in output.read_text().splitlines()]
+                self.assertEqual(records, [
+                    {"active": True, "name": "A", "orders": 3},
+                    {"active": True, "name": "B", "orders": 3},
+                    {"active": True, "name": "A", "orders": 4},
+                ])
+                self.assertEqual(len(errors.read_text().splitlines()), 1)
+
+    def test_cli_csv_output_also_deduplicates(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(directory, self.ROWS["csv"], "csv")
+            output, errors = Path(directory) / "out.csv", Path(directory) / "errors.jsonl"
+            run = run_cli(path, output, errors, fmt="csv", output_format="csv",
+                          extra=("--deduplicate-by", "name",
+                                 "--deduplicate-by", "orders"))
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout),
+                             {"accepted": 3, "rejected": 1, "deduplicated": 2})
+            self.assertEqual(output.read_text(encoding="utf-8"),
+                             "name,orders,active\n"
+                             "A,3,true\nB,3,true\nA,4,true\n")
+
+    def test_cli_bad_deduplicate_field_exit_two_keeps_files(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.ROWS[fmt], fmt)
+                output, errors = Path(directory) / "out.jsonl", Path(directory) / "errors.jsonl"
+                for flag in (("--deduplicate-by", "nope"),
+                             ("--deduplicate-by", "name", "--deduplicate-by", "name")):
+                    output.write_text("keep me\n", encoding="utf-8")
+                    if errors.exists():
+                        errors.unlink()
+                    run = run_cli(path, output, errors, fmt=fmt, extra=flag)
+                    self.assertEqual(run.returncode, 2, flag)
+                    payload = json.loads(run.stdout)
+                    self.assertEqual(set(payload), {"error"})
+                    self.assertIn("deduplicate_by", payload["error"])
+                    self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                    self.assertFalse(errors.exists())
+
+
 class SchemaStructureTests(unittest.TestCase):
     """Malformed schema shapes raise a clear ValueError before the data
     file is opened, identically for normalize_csv and normalize_jsonl."""
