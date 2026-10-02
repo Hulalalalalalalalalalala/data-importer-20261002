@@ -171,6 +171,78 @@ def _range_field_error(name, value, ranges):
     return None
 
 
+def _lte_field_errors(record, field_errors, lte_fields):
+    """Check every declared ``lte_field`` relation over final integers.
+
+    Runs after structure checks, marker matching, default filling, type
+    conversion, enum and range checks. A relation is skipped when either
+    final value is null or either participating field already has a
+    required, type, enum or range error; the original errors are kept and
+    every other relation is still checked. Relations are evaluated in
+    schema column order and returned as ``(name, message)`` pairs so the
+    caller can file each error under its declaring column's position; a
+    violation names ``lte_field``, both output names and the two actual
+    integers (the local value larger than the target value fails;
+    equality is legal).
+    """
+    errors = []
+    for name, target in lte_fields:
+        if name in field_errors or target in field_errors:
+            continue
+        local = record.get(name)
+        other = record.get(target)
+        if local is None or other is None:
+            continue
+        if local > other:
+            errors.append((
+                name,
+                f"{name}: value {local!r} is greater than lte_field "
+                f"{target!r} value {other!r}"))
+    return errors
+
+
+def _prepare_lte_fields(columns):
+    """Validate the optional ``lte_field`` reference of each integer column.
+
+    Returns a list of ``(name, target)`` pairs in schema column order, one
+    entry per declaring column. The attribute must be a non-blank string
+    naming another ``integer`` column by its output name (source aliases
+    are not recognized); a non-string, a blank string, an unknown field,
+    a self reference, a non-integer target, or declaring ``lte_field`` on
+    a non-integer column is a configuration error. Raises ValueError
+    naming ``lte_field``, the output field and the attribute value before
+    the input is read; the caller's schema is never mutated.
+    """
+    by_name = {column["name"]: column for column in columns}
+    lte_fields = []
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "lte_field" not in column:
+            continue
+        target = column["lte_field"]
+        if not isinstance(target, str):
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} must be a string naming "
+                "an integer column")
+        if not target.strip():
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} must be a non-blank string")
+        if kind != "integer":
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} requires an integer column")
+        if target == name:
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} must not reference the column itself")
+        if target not in by_name:
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} is not a schema column name")
+        if by_name[target]["type"] != "integer":
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} must reference an integer column")
+        lte_fields.append((name, target))
+    return lte_fields
+
+
 def _prepare_missing_values(columns):
     """Validate the optional ``missing_values`` marker list of each column.
 
@@ -263,6 +335,7 @@ def _prepare_schema(schema):
     allowed = _prepare_allowed_values(columns, defaults)
     markers = _prepare_missing_values(columns)
     ranges = _prepare_ranges(columns, defaults)
+    lte_fields = _prepare_lte_fields(columns)
     sources = []
     for column in columns:
         name = column["name"]
@@ -279,7 +352,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, ranges
+    return columns, sources, defaults, allowed, markers, ranges, lte_fields
 
 
 def _prepare_duplicate_by(duplicate_by, names):
@@ -413,8 +486,9 @@ def _csv_error_reason(exc):
 
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults, allowed, markers, ranges = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, ranges, lte_fields = _prepare_schema(schema)
     names = [column["name"] for column in columns]
+    column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
     records, errors = [], []
@@ -450,11 +524,16 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                     # still occupies a physical line number (tracked above).
                     continue
                 record = {}
-                row_errors = []
                 if len(cells) != len(sources):
-                    row_errors.append("wrong number of cells")
+                    row_errors = ["wrong number of cells"]
                 else:
-                    for column, value in zip(columns, cells):
+                    # One error slot per column keeps per-field errors and
+                    # the lte_field relation error attributed to a column in
+                    # schema column order, even when the relation points
+                    # backward at an earlier column.
+                    slots = [[] for _ in columns]
+                    field_error_names = set()
+                    for index, (column, value) in enumerate(zip(columns, cells)):
                         name, kind = column["name"], column["type"]
                         value = value.strip()
                         if value in markers.get(name, ()):
@@ -480,17 +559,24 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                             else:
                                 converted = value
                         except ValueError as exc:
-                            row_errors.append(f"{name}: {exc}")
+                            slots[index].append(f"{name}: {exc}")
+                            field_error_names.add(name)
                             continue
                         enum_error = _enum_field_error(name, converted, allowed)
                         if enum_error is not None:
-                            row_errors.append(enum_error)
+                            slots[index].append(enum_error)
+                            field_error_names.add(name)
                             continue
                         range_error = _range_field_error(name, converted, ranges)
                         if range_error is not None:
-                            row_errors.append(range_error)
+                            slots[index].append(range_error)
+                            field_error_names.add(name)
                         else:
                             record[name] = converted
+                    for name, message in _lte_field_errors(
+                            record, field_error_names, lte_fields):
+                        slots[column_index[name]].append(message)
+                    row_errors = [message for slot in slots for message in slot]
                 if row_errors:
                     errors.append({"row": start_line, "errors": row_errors})
                 else:
@@ -544,8 +630,9 @@ def _convert_jsonl_value(column, value, defaults, markers):
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults, allowed, markers, ranges = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, ranges, lte_fields = _prepare_schema(schema)
     names = [column["name"] for column in columns]
+    column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
     expected = set(sources)
@@ -594,20 +681,32 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
                 errors.append({"row": row_number, "errors": row_errors})
                 continue
             record = {}
-            for column, origin in zip(columns, sources):
+            # One slot per column keeps field errors and the lte_field
+            # relation error attributed to a column in schema order.
+            slots = [[] for _ in columns]
+            field_error_names = set()
+            for index, (column, origin) in enumerate(zip(columns, sources)):
+                name = column["name"]
                 converted, message = _convert_jsonl_value(column, obj[origin], defaults, markers)
                 if message is not None:
-                    row_errors.append(message)
+                    slots[index].append(message)
+                    field_error_names.add(name)
                     continue
-                enum_error = _enum_field_error(column["name"], converted, allowed)
+                enum_error = _enum_field_error(name, converted, allowed)
                 if enum_error is not None:
-                    row_errors.append(enum_error)
+                    slots[index].append(enum_error)
+                    field_error_names.add(name)
                     continue
-                range_error = _range_field_error(column["name"], converted, ranges)
+                range_error = _range_field_error(name, converted, ranges)
                 if range_error is not None:
-                    row_errors.append(range_error)
+                    slots[index].append(range_error)
+                    field_error_names.add(name)
                 else:
-                    record[column["name"]] = converted
+                    record[name] = converted
+            for name, message in _lte_field_errors(
+                    record, field_error_names, lte_fields):
+                slots[column_index[name]].append(message)
+            row_errors = [message for slot in slots for message in slot]
             if row_errors:
                 errors.append({"row": row_number, "errors": row_errors})
             else:

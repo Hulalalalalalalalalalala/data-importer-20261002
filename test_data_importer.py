@@ -2184,6 +2184,337 @@ class IntegerRangeTests(unittest.TestCase):
                 self.assertEqual(hidden_entries(directory), [])
 
 
+class LteFieldRelationTests(unittest.TestCase):
+    """An integer column may declare lte_field naming another integer
+    output column; its final value must not exceed the target's."""
+
+    def lohi_schema(self, **lo_overrides):
+        lo = {"name": "lo", "type": "integer", "lte_field": "hi"}
+        lo.update(lo_overrides)
+        return {"columns": [lo, {"name": "hi", "type": "integer"}]}
+
+    def write_source(self, directory, text, fmt):
+        path = Path(directory) / ("data.csv" if fmt == "csv" else "data.jsonl")
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def normalize(self, path, schema, fmt, **kwargs):
+        return (normalize_csv if fmt == "csv" else normalize_jsonl)(path, schema, **kwargs)
+
+    ROWS = {
+        "csv": "lo,hi\n1,3\n4,3\n,3\n2,2\nbad,3\n",
+        "jsonl": ('{"lo": 1, "hi": 3}\n'
+                  '{"lo": 4, "hi": 3}\n'
+                  '{"lo": null, "hi": 3}\n'
+                  '{"lo": 2, "hi": 2}\n'
+                  '{"lo": "bad", "hi": 3}\n'),
+    }
+
+    def test_five_record_scenario_both_formats(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.ROWS[fmt], fmt)
+                result = self.normalize(path, self.lohi_schema(), fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (3, 2))
+            self.assertEqual(result["records"], [
+                {"lo": 1, "hi": 3},
+                {"lo": None, "hi": 3},
+                {"lo": 2, "hi": 2},
+            ])
+            self.assertEqual([row["row"] for row in result["errors"]],
+                             [3, 6] if fmt == "csv" else [2, 5])
+            self.assertEqual(result["errors"][0]["errors"],
+                             ["lo: value 4 is greater than lte_field 'hi' value 3"])
+            type_error = result["errors"][1]["errors"]
+            self.assertEqual(len(type_error), 1)
+            self.assertTrue(type_error[0].startswith("lo:"))
+            self.assertNotIn("lte_field", type_error[0])
+
+    def test_equality_is_legal(self):
+        for fmt, text in (("csv", "lo,hi\n5,5\n0,0\n-2,-2\n"),
+                          ("jsonl", '{"lo": 5, "hi": 5}\n{"lo": 0, "hi": 0}\n'
+                                    '{"lo": -2, "hi": -2}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, self.lohi_schema(), fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (3, 0), fmt)
+            self.assertEqual(result["errors"], [])
+
+    def test_null_on_either_side_skips_the_relation(self):
+        schema = {"columns": [
+            {"name": "lo", "type": "integer", "lte_field": "hi"},
+            {"name": "hi", "type": "integer"},
+        ]}
+        for fmt, text in (("csv", "lo,hi\n9,\n,9\n,\n"),
+                          ("jsonl", '{"lo": 9, "hi": null}\n{"lo": null, "hi": 9}\n'
+                                    '{"lo": null, "hi": null}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (3, 0), fmt)
+
+    def test_defaults_participate_in_the_relation(self):
+        schema = {"columns": [
+            {"name": "lo", "type": "integer", "default": 9, "lte_field": "hi"},
+            {"name": "hi", "type": "integer"},
+        ]}
+        for fmt, text in (("csv", "lo,hi\n,1\n,\n3,3\n"),
+                          ("jsonl", '{"lo": null, "hi": 1}\n{"lo": null, "hi": null}\n'
+                                    '{"lo": 3, "hi": 3}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (2, 1), fmt)
+            self.assertEqual(result["errors"][0]["errors"],
+                             ["lo: value 9 is greater than lte_field 'hi' value 1"])
+            self.assertEqual(result["records"], [{"lo": 9, "hi": None},
+                                                 {"lo": 3, "hi": 3}])
+
+    def test_defaults_on_both_sides_make_a_row_error_not_a_config_error(self):
+        # Two defaults standing in a violating relation are legal config;
+        # the violation surfaces per row, with no extra default checks.
+        schema = {"columns": [
+            {"name": "lo", "type": "integer", "default": 9, "lte_field": "hi"},
+            {"name": "hi", "type": "integer", "default": 0},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_source(directory, "lo,hi\n,\n1,1\n", "csv")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (1, 1))
+        self.assertEqual(result["errors"][0]["errors"],
+                         ["lo: value 9 is greater than lte_field 'hi' value 0"])
+
+    def test_relation_skips_participant_required_type_enum_range_errors(self):
+        schema = {"columns": [
+            {"name": "lo", "type": "integer", "maximum": 5,
+             "allowed_values": [1, 4, 7], "lte_field": "hi"},
+            {"name": "hi", "type": "integer", "required": True,
+             "allowed_values": [3, 4]},
+        ]}
+        # 7 passes conversion+enum but fails lo's own range, and 4 > 3:
+        # the lo range error is kept and the relation skipped.
+        # bad hi keeps its type error and the relation is skipped.
+        # empty hi keeps its required error and the relation is skipped.
+        # 4/4 equal is fine; 1/3 is fine.
+        for fmt, text in (("csv", "lo,hi\n7,3\n4,x\n4,\n4,4\n1,3\n"),
+                          ("jsonl", '{"lo": 7, "hi": 3}\n{"lo": 4, "hi": "x"}\n'
+                                    '{"lo": 4, "hi": null}\n{"lo": 4, "hi": 4}\n'
+                                    '{"lo": 1, "hi": 3}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (2, 3), fmt)
+            for row in result["errors"]:
+                self.assertEqual(len(row["errors"]), 1)
+                self.assertNotIn("lte_field", row["errors"][0])
+
+    def test_other_relations_still_checked_when_one_is_skipped(self):
+        schema = {"columns": [
+            {"name": "a", "type": "integer", "lte_field": "b"},
+            {"name": "b", "type": "integer"},
+            {"name": "c", "type": "integer", "lte_field": "b"},
+        ]}
+        for fmt, text in (("csv", "a,b,c\nx,1,8\n"),
+                          ("jsonl", '{"a": "x", "b": 1, "c": 8}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual(result["errors"][0]["errors"], [
+                "a: invalid literal for int() with base 10: 'x'"
+                if fmt == "csv" else "a: expected integer",
+                "c: value 8 is greater than lte_field 'b' value 1",
+            ])
+
+    def test_errors_filed_in_schema_column_order(self):
+        # a (column 1) points forward at b (column 2); a's relation error
+        # must still precede a type error on a later column.
+        schema = {"columns": [
+            {"name": "a", "type": "integer", "lte_field": "b"},
+            {"name": "b", "type": "integer"},
+            {"name": "c", "type": "integer", "lte_field": "b"},
+        ]}
+        for fmt, text in (("csv", "a,b,c\n9,1,8\n"),
+                          ("jsonl", '{"a": 9, "b": 1, "c": 8}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual(result["errors"][0]["errors"], [
+                "a: value 9 is greater than lte_field 'b' value 1",
+                "c: value 8 is greater than lte_field 'b' value 1",
+            ])
+
+    def test_reference_direction_independent_of_declaration_order(self):
+        schema = {"columns": [
+            {"name": "hi", "type": "integer"},
+            {"name": "mid", "type": "integer", "lte_field": "hi"},
+            {"name": "lo", "type": "integer", "lte_field": "mid"},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(
+                directory, "hi,mid,lo\n3,2,1\n0,2,1\n", "csv")
+            result = normalize_csv(path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (1, 1))
+        self.assertEqual(result["errors"][0]["errors"],
+                         ["mid: value 2 is greater than lte_field 'hi' value 0"])
+        self.assertEqual(result["records"], [{"hi": 3, "mid": 2, "lo": 1}])
+
+    def test_relation_precedes_filter_and_duplicates(self):
+        # A violating row is rejected even when the filter matches it, and
+        # duplicate_by counts only the records surviving filtering.
+        rows = ("lo,hi\n1,3\n4,3\n1,9\n0,9\n"
+                , '{"lo": 1, "hi": 3}\n{"lo": 4, "hi": 3}\n'
+                  '{"lo": 1, "hi": 9}\n{"lo": 0, "hi": 9}\n')
+        for fmt, text in zip(("csv", "jsonl"), rows):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(
+                    path, self.lohi_schema(), fmt,
+                    filter_eq={"field": "hi", "value": 3})
+            self.assertEqual((result["accepted"], result["filtered"],
+                              result["rejected"]), (1, 2, 1), fmt)
+            self.assertEqual(result["records"], [{"lo": 1, "hi": 3}])
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(directory, rows[0], "csv")
+            result = normalize_csv(path, self.lohi_schema(), duplicate_by=["lo"])
+        # (4,3) is rejected; the two valid lo=1 records form the only group.
+        self.assertEqual(result["duplicates"],
+                         [{"key": {"lo": 1}, "record_numbers": [1, 2]}])
+
+    def test_later_rows_keep_being_processed(self):
+        for fmt, text in (("csv", "lo,hi\n4,3\n1,1\n4,3\n"),
+                          ("jsonl", '{"lo": 4, "hi": 3}\n{"lo": 1, "hi": 1}\n'
+                                    '{"lo": 4, "hi": 3}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, self.lohi_schema(), fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (1, 2), fmt)
+
+    def test_invalid_lte_field_config_raises_before_reading(self):
+        import copy
+        missing = {"csv": ROOT / "samples" / "does-not-exist.csv",
+                   "jsonl": ROOT / "samples" / "does-not-exist.jsonl"}
+        bad_columns = [
+            {"name": "lo", "type": "integer", "lte_field": 3},
+            {"name": "lo", "type": "integer", "lte_field": True},
+            {"name": "lo", "type": "integer", "lte_field": None},
+            {"name": "lo", "type": "integer", "lte_field": ["hi"]},
+            {"name": "lo", "type": "integer", "lte_field": ""},
+            {"name": "lo", "type": "integer", "lte_field": "   "},
+            {"name": "lo", "type": "integer", "lte_field": "nope"},
+            {"name": "lo", "type": "integer", "lte_field": "lo"},
+            {"name": "lo", "type": "integer", "lte_field": "s"},
+            {"name": "s", "type": "string", "lte_field": "lo"},
+            {"name": "lo", "type": "boolean", "lte_field": "hi"},
+        ]
+        for fmt in ("csv", "jsonl"):
+            normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+            for column in bad_columns:
+                others = [c for c in (
+                    {"name": "lo", "type": "integer"},
+                    {"name": "hi", "type": "integer"},
+                    {"name": "s", "type": "string"},
+                ) if c["name"] != column["name"]]
+                schema = {"columns": [column] + others}
+                with self.subTest(fmt=fmt, column=column):
+                    snapshot = copy.deepcopy(schema)
+                    with self.assertRaises(ValueError) as caught:
+                        normalize(missing[fmt], schema)
+                    message = str(caught.exception)
+                    self.assertIn("lte_field", message)
+                    self.assertIn(column["name"], message)
+                    self.assertIn(repr(column["lte_field"]), message)
+                    self.assertEqual(schema, snapshot)
+
+    def test_source_alias_is_not_a_lte_field_target(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [
+            {"name": "lo", "type": "integer", "source": "low", "lte_field": "high"},
+            {"name": "hi", "type": "integer", "source": "high"},
+        ]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertIn("lte_field", str(caught.exception))
+        # the output name is accepted and processing reaches file open
+        schema["columns"][0]["lte_field"] = "hi"
+        with self.assertRaises(OSError):
+            normalize_csv(missing, schema)
+
+    def test_structure_check_still_runs_first(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [
+            {"name": "lo", "type": "date", "lte_field": 3},
+        ]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertNotIn("lte_field", str(caught.exception))
+
+    def test_cli_relation_row_errors_exit_one_and_export(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = self.write_source(directory, self.ROWS[fmt], fmt)
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps(self.lohi_schema()), encoding="utf-8")
+                output, errors = Path(directory) / "records.jsonl", Path(directory) / "errors.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(json.loads(run.stdout), {"accepted": 3, "rejected": 2})
+                records = [json.loads(line) for line in output.read_text().splitlines()]
+                self.assertEqual(records, [
+                    {"hi": 3, "lo": 1}, {"hi": 3, "lo": None}, {"hi": 2, "lo": 2}])
+                error_rows = [json.loads(line) for line in errors.read_text().splitlines()]
+                self.assertEqual([row["row"] for row in error_rows],
+                                 [3, 6] if fmt == "csv" else [2, 5])
+                self.assertEqual(error_rows[0]["errors"],
+                                 ["lo: value 4 is greater than lte_field 'hi' value 3"])
+                self.assertEqual(hidden_entries(directory), [])
+
+    def test_cli_relation_errors_with_csv_output(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_source(directory, self.ROWS["csv"], "csv")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(self.lohi_schema()), encoding="utf-8")
+            output, errors = Path(directory) / "records.csv", Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--output-format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"),
+                             "lo,hi\n1,3\n,3\n2,2\n")
+            self.assertEqual(len(errors.read_text().splitlines()), 2)
+
+    def test_cli_bad_lte_field_exit_two_keeps_files(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = Path(directory) / f"source.{fmt}"
+                source.write_text(
+                    "lo,hi\n1,3\n" if fmt == "csv"
+                    else '{"lo": 1, "hi": 3}\n', encoding="utf-8")
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps({"columns": [
+                    {"name": "lo", "type": "integer", "lte_field": "nope"},
+                    {"name": "hi", "type": "integer"},
+                ]}), encoding="utf-8")
+                output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+                output.write_text("keep me\n", encoding="utf-8")
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("lte_field", payload["error"])
+                self.assertIn("lo", payload["error"])
+                self.assertIn("nope", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
+
+
 class SchemaStructureTests(unittest.TestCase):
     """Malformed schema shapes raise a clear ValueError before the data
     file is opened, identically for normalize_csv and normalize_jsonl."""
