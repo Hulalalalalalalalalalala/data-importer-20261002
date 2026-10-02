@@ -43,6 +43,59 @@ class ImporterTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
+    def write_csv_bytes(self, directory, data):
+        path = Path(directory) / "data.csv"
+        path.write_bytes(data)
+        return path
+
+    def test_physical_rows_blank_and_multiline_fixture(self):
+        text = ("name,orders,active\n\n\"Ma\nya\",3,true\nBad,x,true\n"
+                "\"No\nra\",2,\nZ,3,false\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema, duplicate_by=["orders"])
+        self.assertEqual((result["accepted"], result["rejected"]), (2, 2))
+        self.assertEqual([row["row"] for row in result["errors"]], [5, 6])
+        self.assertIn("orders", result["errors"][0]["errors"][0])
+        self.assertEqual(result["errors"][1]["errors"], ["active: required value is empty"])
+        self.assertEqual([record["name"] for record in result["records"]], ["Ma\nya", "Z"])
+        self.assertEqual(result["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2]}])
+
+    def test_physical_rows_line_endings_bom_and_no_final_newline(self):
+        base = (b"name,orders,active\r\n\r\n\"Ma\r\nya\",3,true\r\nBad,x,true\r\n"
+                b"\"No\r\nra\",2,\r\nZ,3,false\r\n")
+        lone_cr = base.replace(b"\r\n", b"\r")
+        bom = b"\xef\xbb\xbf" + base
+        no_final = base[:-2]  # drop trailing CRLF
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for data in (base, lone_cr, bom, no_final):
+                csv_path = self.write_csv_bytes(directory, data)
+                result = normalize_csv(csv_path, self.schema)
+                self.assertEqual((result["accepted"], result["rejected"]), (2, 2), data)
+                self.assertEqual([row["row"] for row in result["errors"]], [5, 6], data)
+
+    def test_physical_rows_multiline_reject_counts_once(self):
+        # A quoted field spanning lines is one record; its error reports the
+        # starting physical line. Consecutive/trailing blank lines add nothing.
+        text = "name,orders,active\n\n\n\"a\nb\",nope,\n\"x\n\ny\",1,true\n\n"
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (1, 1))
+        self.assertEqual(result["errors"][0]["row"], 4)
+        self.assertEqual([m.split(":", 1)[0] for m in result["errors"][0]["errors"]],
+                         ["orders", "active"])
+        self.assertEqual(result["records"][0]["name"], "x\n\ny")
+
+    def test_physical_rows_whitespace_only_keeps_csv_rule(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\nMaya,3,true\n   \n")
+            result = normalize_csv(csv_path, self.schema)
+        self.assertEqual(result["rejected"], 1)
+        self.assertEqual(result["errors"][0]["row"], 3)
+        self.assertEqual(result["errors"][0]["errors"], ["wrong number of cells"])
+
     def test_source_mapping(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             csv_path = self.write_csv(directory, "display_name,purchase_count,active\nMaya,3,TRUE\n")

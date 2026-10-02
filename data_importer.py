@@ -74,18 +74,33 @@ def normalize_csv(source, schema, duplicate_by=None):
     duplicate_fields = _prepare_duplicate_by(duplicate_by, [column["name"] for column in columns])
     records, errors = [], []
     with Path(source).open(encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames != sources:
+        reader = csv.reader(handle)
+        try:
+            header = next(reader)
+        except StopIteration:
+            header = None
+        if header != sources:
             raise ValueError("CSV header must match schema column sources and order exactly")
-        for row_number, row in enumerate(reader, start=2):
+        # reader.line_num is the physical line where the row just read ends;
+        # LF, CRLF (counted once) and a lone CR all terminate a line. A record's
+        # starting physical line is one past the end of the preceding row, so
+        # skipped empty lines and newlines inside quoted fields shift it down.
+        previous_end = reader.line_num
+        for cells in reader:
+            start_line = previous_end + 1
+            previous_end = reader.line_num
+            if not cells:
+                # An ordinary empty physical line: skipped as a record but it
+                # still occupies a physical line number (tracked above).
+                continue
             record = {}
             row_errors = []
-            if None in row or any(value is None for value in row.values()):
+            if len(cells) != len(sources):
                 row_errors.append("wrong number of cells")
             else:
-                for column, origin in zip(columns, sources):
+                for column, value in zip(columns, cells):
                     name, kind = column["name"], column["type"]
-                    value = row[origin].strip()
+                    value = value.strip()
                     try:
                         if not value:
                             if column.get("required", False):
@@ -102,7 +117,7 @@ def normalize_csv(source, schema, duplicate_by=None):
                     except ValueError as exc:
                         row_errors.append(f"{name}: {exc}")
             if row_errors:
-                errors.append({"row": row_number, "errors": row_errors})
+                errors.append({"row": start_line, "errors": row_errors})
             else:
                 records.append(record)
     result = {"records": records, "errors": errors, "accepted": len(records), "rejected": len(errors)}
