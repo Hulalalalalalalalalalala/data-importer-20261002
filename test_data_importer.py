@@ -1916,6 +1916,279 @@ class MissingValuesTests(unittest.TestCase):
                 self.assertFalse(errors.exists())
 
 
+class BooleanAliasesTests(unittest.TestCase):
+    """A boolean column may declare per-column text aliases."""
+
+    def alias_schema(self, **active_overrides):
+        column = {"name": "active", "type": "boolean",
+                  "boolean_aliases": {"是": True, "否": False, "YES": True}}
+        column.update(active_overrides)
+        return {"columns": [column]}
+
+    ROWS = {
+        "csv": "active\n 是 \n否\nyes\n未知\n",
+        "jsonl": '{"active": " 是 "}\n{"active": "否"}\n'
+                 '{"active": "yes"}\n{"active": "未知"}\n',
+    }
+
+    def write_source(self, directory, text, fmt):
+        path = Path(directory) / ("data.csv" if fmt == "csv" else "data.jsonl")
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def normalize(self, path, schema, fmt, **kwargs):
+        return (normalize_csv if fmt == "csv" else normalize_jsonl)(path, schema, **kwargs)
+
+    def test_alias_conversion_both_formats(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.ROWS[fmt], fmt)
+                result = self.normalize(path, self.alias_schema(), fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (3, 1))
+            self.assertEqual([record["active"] for record in result["records"]],
+                             [True, False, True])
+            self.assertEqual(result["errors"][0]["row"], 5 if fmt == "csv" else 4)
+            self.assertEqual(result["errors"][0]["errors"],
+                             ["active: boolean must be true or false"])
+            self.assertEqual(set(result), {"records", "errors", "accepted", "rejected"})
+
+    def test_alias_failure_keeps_later_rows(self):
+        texts = {
+            "csv": "active\n未知\n是\n否\n",
+            "jsonl": '{"active": "未知"}\n{"active": "是"}\n{"active": "否"}\n',
+        }
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, texts[fmt], fmt)
+                result = self.normalize(path, self.alias_schema(), fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (2, 1))
+            self.assertEqual(result["errors"][0]["row"], 2 if fmt == "csv" else 1)
+            self.assertEqual([record["active"] for record in result["records"]],
+                             [True, False])
+
+    def test_filter_eq_true_and_duplicate_positions(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.ROWS[fmt], fmt)
+                result = self.normalize(
+                    path, self.alias_schema(), fmt,
+                    filter_eq={"field": "active", "value": True},
+                    duplicate_by=["active"])
+            self.assertEqual((result["accepted"], result["filtered"], result["rejected"]),
+                             (2, 1, 1))
+            self.assertEqual([record["active"] for record in result["records"]], [True, True])
+            self.assertEqual(result["duplicates"],
+                             [{"key": {"active": True}, "record_numbers": [1, 2]}])
+
+    def test_native_builtin_and_trim_casefold_matching(self):
+        # JSON booleans survive verbatim; built-in spellings keep their
+        # case-insensitive rule; alias keys/inputs are trimmed and folded.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(
+                directory,
+                '{"active": true}\n{"active": false}\n{"active": "TrUe"}\n'
+                '{"active": " yes "}\n{"active": " YeS "}\n',
+                "jsonl")
+            result = normalize_jsonl(path, self.alias_schema())
+        self.assertEqual([record["active"] for record in result["records"]],
+                         [True, False, True, True, True])
+        self.assertEqual(result["rejected"], 0)
+        schema = {"columns": [{"name": "active", "type": "boolean",
+                               "boolean_aliases": {" 是 ": True}}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(directory, "active\n是\n 是 \n", "csv")
+            result = normalize_csv(path, schema)
+        self.assertEqual([record["active"] for record in result["records"]], [True, True])
+
+    def test_numbers_arrays_and_objects_still_error(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(
+                directory,
+                '{"active": 1}\n{"active": 0}\n{"active": ["true"]}\n'
+                '{"active": {"是": true}}\n{"active": null}\n',
+                "jsonl")
+            result = normalize_jsonl(path, self.alias_schema())
+        self.assertEqual(result["accepted"], 1)
+        self.assertIsNone(result["records"][0]["active"])
+        self.assertEqual(result["rejected"], 4)
+        self.assertEqual([row["row"] for row in result["errors"]], [1, 2, 3, 4])
+        for row in result["errors"]:
+            self.assertEqual(row["errors"], ["active: boolean must be true or false"])
+
+    def test_missing_values_precedes_aliases(self):
+        # A marker hit follows the default/required/null flow even when the
+        # same text is a configured alias.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema = self.alias_schema(missing_values=["未知", "否"], default=True)
+            path = self.write_source(
+                directory,
+                '{"active": "未知"}\n{"active": "否"}\n{"active": "是"}\n',
+                "jsonl")
+            result = normalize_jsonl(path, schema)
+        self.assertEqual([record["active"] for record in result["records"]],
+                         [True, True, True])
+        for fmt, text in (
+                ("csv", "active\n未知\n是\n"),
+                ("jsonl", '{"active": "未知"}\n{"active": "是"}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                required = self.normalize(
+                    path, self.alias_schema(missing_values=["未知"], required=True), fmt)
+                optional = self.normalize(
+                    path, self.alias_schema(missing_values=["未知"]), fmt)
+            self.assertEqual(required["errors"][0]["errors"],
+                             ["active: required value is empty"])
+            self.assertEqual((required["accepted"], required["rejected"]), (1, 1))
+            self.assertIsNone(optional["records"][0]["active"])
+
+    def test_default_must_still_be_native_boolean(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        for default in ("是", "true", "YES", 1, 0, None):
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, self.alias_schema(default=default))
+            message = str(caught.exception)
+            self.assertIn("default", message)
+            self.assertNotIn("boolean must be", message)
+
+    def test_allowed_values_runs_after_alias_conversion(self):
+        schema = self.alias_schema(allowed_values=[False])
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(directory, "active\n是\n否\ntrue\nfalse\n", "csv")
+            result = normalize_csv(path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (2, 2))
+        self.assertEqual([record["active"] for record in result["records"]], [False, False])
+        self.assertEqual([row["row"] for row in result["errors"]], [2, 4])
+        self.assertEqual(result["errors"][0]["errors"],
+                         ["active: value True is not one of allowed_values [False]"])
+
+    def test_invalid_boolean_aliases_raises_before_reading(self):
+        import copy
+        missing = {"csv": ROOT / "samples" / "does-not-exist.csv",
+                   "jsonl": ROOT / "samples" / "does-not-exist.jsonl"}
+        bad_attributes = [None, True, 3, "x", [], {}, [{"是": True}]]
+        bad_keys = ({1: True}, {"": True}, {"   ": True})
+        bad_values = ({"是": "true"}, {"是": 1}, {"是": 0}, {"是": None},
+                      {"是": [True]}, {"是": {}})
+        bad = ([(v, v) for v in bad_attributes]
+               + [(m, next(iter(m))) for m in bad_keys]
+               + [(m, list(m.values())[0]) for m in bad_values])
+        for fmt in ("csv", "jsonl"):
+            normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+            for mapping, offending in bad:
+                with self.subTest(fmt=fmt, mapping=mapping):
+                    schema = {"columns": [
+                        {"name": "active", "type": "boolean",
+                         "boolean_aliases": mapping}]}
+                    with self.assertRaises(ValueError) as caught:
+                        normalize(missing[fmt], schema)
+                    message = str(caught.exception)
+                    self.assertIn("boolean_aliases", message)
+                    self.assertIn("active", message)
+                    self.assertIn(repr(offending), message)
+        # folded duplicates are invalid even when the mapped boolean agrees
+        for mapping in (
+                {"YES": True, " yes ": True},
+                {"是": True, " 是 ": False},
+                {"Yes": True, "YES": False}):
+            schema = {"columns": [{"name": "active", "type": "boolean",
+                                   "boolean_aliases": mapping}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing["csv"], schema)
+            message = str(caught.exception)
+            self.assertIn("boolean_aliases", message)
+            self.assertIn("repeated", message)
+        # normalized keys equal to the built-in spellings are refused
+        for mapping in ({"true": True}, {" True ": False}, {"FALSE": False}):
+            schema = {"columns": [{"name": "active", "type": "boolean",
+                                   "boolean_aliases": mapping}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing["csv"], schema)
+            self.assertIn("boolean_aliases", str(caught.exception))
+        # only boolean columns may carry the attribute
+        for kind in ("string", "integer"):
+            schema = {"columns": [{"name": "f", "type": kind,
+                                   "boolean_aliases": {"是": True}}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing["csv"], schema)
+            message = str(caught.exception)
+            self.assertIn("boolean_aliases", message)
+            self.assertIn("f", message)
+
+    def test_schema_structure_check_still_runs_first(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        for schema in (
+                {"columns": [{"name": "f", "type": "date",
+                              "boolean_aliases": {"x": True}}]},
+                {"columns": [{"type": "boolean", "boolean_aliases": {}}]}):
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("schema", message)
+            self.assertNotIn("boolean_aliases", message)
+
+    def test_schema_dict_unchanged_with_aliases(self):
+        import copy
+        schema = self.alias_schema()
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(directory, self.ROWS["jsonl"], "jsonl")
+            normalize_jsonl(path, schema)
+        self.assertEqual(schema, snapshot)
+        # the retained mapping content itself stays as declared
+        self.assertEqual(set(schema["columns"][0]["boolean_aliases"]), {"是", "否", "YES"})
+
+    def test_columns_without_aliases_keep_old_behavior(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_source(directory, "active\nyes\n是\n", "csv")
+            result = normalize_csv(path, {"columns": [{"name": "active", "type": "boolean"}]})
+        self.assertEqual((result["accepted"], result["rejected"]), (0, 2))
+
+    def test_cli_aliases_filter_duplicate_and_csv_export(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_source(directory, self.ROWS["csv"], "csv")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(self.alias_schema()), encoding="utf-8")
+            output, errors = Path(directory) / "out.csv", Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(csv_path),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--output-format", "csv",
+                       "--filter-eq", json.dumps({"field": "active", "value": True}),
+                       "--duplicate-by", "active"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {
+                "accepted": 2, "rejected": 1, "filtered": 1,
+                "duplicates": [{"key": {"active": True}, "record_numbers": [1, 2]}]})
+            self.assertEqual(output.read_text(encoding="utf-8"), "active\ntrue\ntrue\n")
+            error_rows = [json.loads(line) for line in errors.read_text().splitlines()]
+            self.assertEqual(error_rows, [{"row": 5, "errors": [
+                "active: boolean must be true or false"]}])
+
+    def test_cli_bad_boolean_aliases_exit_two_keeps_files(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = self.write_source(
+                    directory, self.ROWS[fmt], fmt)
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps({"columns": [
+                    {"name": "active", "type": "boolean",
+                     "boolean_aliases": {"YES": True, " yes ": True}}]}), encoding="utf-8")
+                output, errors = Path(directory) / "out.jsonl", Path(directory) / "errors.jsonl"
+                output.write_text("keep me\n", encoding="utf-8")
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("active", payload["error"])
+                self.assertIn("boolean_aliases", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
+
+
 class IntegerRangeTests(unittest.TestCase):
     """An integer column may declare inclusive minimum/maximum bounds."""
 
