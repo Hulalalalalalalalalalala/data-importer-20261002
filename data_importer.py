@@ -171,6 +171,75 @@ def _range_field_error(name, value, ranges):
     return None
 
 
+def _prepare_lte_fields(columns):
+    """Validate the optional ``lte_field`` cross-field reference of each column.
+
+    Returns a mapping of output field name to the referenced output field
+    name, in schema column order. The attribute may appear only on
+    ``integer`` columns and must be a non-blank string naming another
+    ``integer`` output field; the reference matches output names literally
+    (``source`` aliases are not recognized) and column declaration order
+    does not restrict the direction of the reference. A non-string or
+    blank value, an unknown field, a self reference and a non-integer
+    target are configuration errors. Raises ValueError naming
+    ``lte_field``, the column and the offending value before the input is
+    read; the caller's schema is never mutated.
+    """
+    kinds = {column["name"]: column["type"] for column in columns}
+    relations = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "lte_field" not in column:
+            continue
+        target = column["lte_field"]
+        if kind != "integer":
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} requires an integer column")
+        if not isinstance(target, str):
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} must be a string")
+        if not target.strip():
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} must not be blank")
+        if target not in kinds:
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} is not a schema column name")
+        if target == name:
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} must not reference "
+                "the column itself")
+        if kinds[target] != "integer":
+            raise ValueError(
+                f"column {name!r} lte_field {target!r} must reference an "
+                "integer column")
+        relations[name] = target
+    return relations
+
+
+def _lte_field_errors(record, lte_fields):
+    """Return the cross-field relation violations of one converted record.
+
+    Runs after structure checks, marker matching, default filling, type
+    conversion, enum and range checks, so a field absent from the record
+    already carries a required, type, enum or range error and any relation
+    touching it is skipped (the original errors are kept); a null on
+    either side skips the comparison as well. Every other relation is
+    still checked, and messages follow schema column order.
+    """
+    messages = []
+    for name, target in lte_fields.items():
+        if name not in record or target not in record:
+            continue
+        value, other = record[name], record[target]
+        if value is None or other is None:
+            continue
+        if value > other:
+            messages.append(
+                f"{name}: value {value!r} is greater than lte_field "
+                f"{target!r} value {other!r}")
+    return messages
+
+
 def _prepare_missing_values(columns):
     """Validate the optional ``missing_values`` marker list of each column.
 
@@ -263,6 +332,7 @@ def _prepare_schema(schema):
     allowed = _prepare_allowed_values(columns, defaults)
     markers = _prepare_missing_values(columns)
     ranges = _prepare_ranges(columns, defaults)
+    lte_fields = _prepare_lte_fields(columns)
     sources = []
     for column in columns:
         name = column["name"]
@@ -279,7 +349,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, ranges
+    return columns, sources, defaults, allowed, markers, ranges, lte_fields
 
 
 def _prepare_duplicate_by(duplicate_by, names):
@@ -413,7 +483,8 @@ def _csv_error_reason(exc):
 
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults, allowed, markers, ranges = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, ranges, lte_fields = \
+        _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -491,6 +562,7 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                             row_errors.append(range_error)
                         else:
                             record[name] = converted
+                row_errors.extend(_lte_field_errors(record, lte_fields))
                 if row_errors:
                     errors.append({"row": start_line, "errors": row_errors})
                 else:
@@ -544,7 +616,8 @@ def _convert_jsonl_value(column, value, defaults, markers):
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults, allowed, markers, ranges = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, ranges, lte_fields = \
+        _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -608,6 +681,7 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
                     row_errors.append(range_error)
                 else:
                     record[column["name"]] = converted
+            row_errors.extend(_lte_field_errors(record, lte_fields))
             if row_errors:
                 errors.append({"row": row_number, "errors": row_errors})
             else:
