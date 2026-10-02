@@ -380,6 +380,38 @@ def _prepare_duplicate_by(duplicate_by, names):
     return list(duplicate_by)
 
 
+def _prepare_deduplicate_by(deduplicate_by, names):
+    """Validate the optional first-of-group dedup fields against output names.
+
+    Returns a new list or None when deduplication is disabled. The value
+    must be a non-empty list of non-blank strings, each naming a schema
+    output column literally (never trimmed; source aliases are not recognized), with
+    no repeat and no unknown field. Raises ValueError naming
+    ``deduplicate_by`` and the offending value before the input is opened; the
+    caller's list and schema are never mutated.
+    """
+    if deduplicate_by is None:
+        return None
+    if not isinstance(deduplicate_by, list):
+        raise ValueError(
+            f"deduplicate_by {deduplicate_by!r} must be a non-empty list of schema field names")
+    if not deduplicate_by:
+        raise ValueError(f"deduplicate_by {deduplicate_by!r} must not be empty")
+    known = set(names)
+    seen = set()
+    fields = []
+    for member in deduplicate_by:
+        if not isinstance(member, str) or not member.strip():
+            raise ValueError(f"deduplicate_by entry {member!r} must be a non-blank string")
+        if member in seen:
+            raise ValueError(f"deduplicate_by field {member!r} is repeated")
+        if member not in known:
+            raise ValueError(f"deduplicate_by field {member!r} is not a schema column name")
+        seen.add(member)
+        fields.append(member)
+    return fields
+
+
 def _find_duplicates(records, duplicate_by):
     """Group accepted records by the converted values of duplicate_by fields."""
     groups = {}
@@ -436,18 +468,44 @@ def _prepare_filter_eq(filter_eq, columns):
     return field, value
 
 
-def _build_result(records, errors, duplicate_fields, filter_condition):
-    """Apply the equality filter to fully validated records, then counts."""
+def _deduplicate_records(records, deduplicate_fields):
+    """Keep the first record of each key tuple, in first-seen order.
+
+    Keys are the converted values of the given output fields compared by
+    equality: strings case-sensitively, null equal to null, integers and
+    booleans by value. A later record whose other fields differ is dropped
+    whole -- it never merges with or overwrites the kept record.
+    Returns (kept, removed_count).
+    """
+    seen_keys = set()
+    kept = []
+    for record in records:
+        key = tuple(record[field] for field in deduplicate_fields)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        kept.append(record)
+    return kept, len(records) - len(kept)
+
+
+def _build_result(records, errors, duplicate_fields, filter_condition, deduplicate_fields=None):
+    """Filter fully validated records, deduplicate the survivors, then counts."""
     if filter_condition is None:
         kept, filtered_count = records, 0
     else:
         field, expected = filter_condition
         kept = [record for record in records if record[field] == expected]
         filtered_count = len(records) - len(kept)
+    if deduplicate_fields is not None:
+        kept, deduplicated_count = _deduplicate_records(kept, deduplicate_fields)
+    else:
+        deduplicated_count = 0
     result = {"records": kept, "errors": errors, "accepted": len(kept),
               "rejected": len(errors)}
     if filter_condition is not None:
         result["filtered"] = filtered_count
+    if deduplicate_fields is not None:
+        result["deduplicated"] = deduplicated_count
     if duplicate_fields is not None:
         result["duplicates"] = _find_duplicates(kept, duplicate_fields)
     return result
@@ -485,12 +543,13 @@ def _csv_error_reason(exc):
     return message
 
 
-def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
+def normalize_csv(source, schema, duplicate_by=None, filter_eq=None, deduplicate_by=None):
     columns, sources, defaults, allowed, markers, ranges, lte_fields = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
+    deduplicate_fields = _prepare_deduplicate_by(deduplicate_by, names)
     records, errors = [], []
     # strict=True turns the two quote-syntax problems that a lenient reader
     # silently folds into the data into csv.Error: a quoted field still open
@@ -586,7 +645,8 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                 source, previous_end + 1, _csv_error_reason(exc)) from None
         if header is None:
             raise ValueError("CSV header must match schema column sources and order exactly")
-    return _build_result(records, errors, duplicate_fields, filter_condition)
+    return _build_result(records, errors, duplicate_fields, filter_condition,
+                       deduplicate_fields)
 
 
 def _convert_jsonl_value(column, value, defaults, markers):
@@ -629,12 +689,13 @@ def _convert_jsonl_value(column, value, defaults, markers):
     return None, f"{name}: boolean must be true or false"
 
 
-def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
+def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None, deduplicate_by=None):
     columns, sources, defaults, allowed, markers, ranges, lte_fields = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
+    deduplicate_fields = _prepare_deduplicate_by(deduplicate_by, names)
     expected = set(sources)
     records, errors = [], []
     decoded_pairs = []
@@ -711,7 +772,8 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
                 errors.append({"row": row_number, "errors": row_errors})
             else:
                 records.append(record)
-    return _build_result(records, errors, duplicate_fields, filter_condition)
+    return _build_result(records, errors, duplicate_fields, filter_condition,
+                       deduplicate_fields)
 
 
 def write_jsonl(path, records):
@@ -966,6 +1028,8 @@ def main():
                         help="records output format: jsonl (default) or csv")
     parser.add_argument("--duplicate-by", action="append", metavar="FIELD",
                         help="output field to report duplicate accepted records by; repeatable")
+    parser.add_argument("--deduplicate-by", action="append", metavar="FIELD",
+                        help="output field to deduplicate accepted records by, keeping the first; repeatable")
     parser.add_argument("--filter-eq", metavar="JSON",
                         help='equality condition as JSON, e.g. {"field": "active", "value": true}')
     args = parser.parse_args()
@@ -990,7 +1054,8 @@ def main():
         normalize = normalize_csv if args.format == "csv" else normalize_jsonl
         schema = json.loads(Path(args.schema).read_text(encoding="utf-8"))
         result = normalize(args.source, schema,
-                           duplicate_by=args.duplicate_by, filter_eq=filter_eq)
+                           duplicate_by=args.duplicate_by, filter_eq=filter_eq,
+                           deduplicate_by=args.deduplicate_by)
         if args.output_format == "csv":
             names = [column["name"] for column in schema["columns"]]
             output_payload = _csv_payload(names, result["records"])
@@ -1002,6 +1067,8 @@ def main():
         summary = {"accepted": result["accepted"], "rejected": result["rejected"]}
         if args.filter_eq is not None:
             summary["filtered"] = result["filtered"]
+        if args.deduplicate_by is not None:
+            summary["deduplicated"] = result["deduplicated"]
         if args.duplicate_by is not None:
             summary["duplicates"] = result["duplicates"]
         print(json.dumps(summary))
