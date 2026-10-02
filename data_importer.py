@@ -72,9 +72,71 @@ def _find_duplicates(records, duplicate_by):
     ]
 
 
-def normalize_csv(source, schema, duplicate_by=None):
+def _prepare_filter_eq(filter_eq, columns):
+    """Validate the optional single-field equality filter.
+
+    The condition is an object with exactly ``field`` and ``value`` keys;
+    field matches an output name literally (source aliases are not
+    recognized) and value must fit the target type, with null allowed for
+    every type. Returns (field, value) or None when filtering is disabled.
+    Raises ValueError before the input is read.
+    """
+    if filter_eq is None:
+        return None
+    if not isinstance(filter_eq, dict):
+        raise ValueError("filter_eq must be an object with 'field' and 'value' keys")
+    keys = set(filter_eq)
+    if keys != {"field", "value"}:
+        details = []
+        missing = [key for key in ("field", "value") if key not in keys]
+        extra = sorted(keys - {"field", "value"})
+        if missing:
+            details.append("missing key(s): " + ", ".join(missing))
+        if extra:
+            details.append("unexpected key(s): " + ", ".join(extra))
+        raise ValueError("filter_eq must contain exactly 'field' and 'value' keys (" + "; ".join(details) + ")")
+    field = filter_eq["field"]
+    if not isinstance(field, str):
+        raise ValueError("filter_eq field must be a string")
+    if not field.strip():
+        raise ValueError("filter_eq field must be a non-blank string")
+    by_name = {column["name"]: column for column in columns}
+    if field not in by_name:
+        raise ValueError(f"filter_eq field {field!r} is not a schema column name")
+    value = filter_eq["value"]
+    kind = by_name[field]["type"]
+    if value is not None:
+        if kind == "string" and not isinstance(value, str):
+            raise ValueError(f"filter_eq value for field {field!r} must be a string or null")
+        if kind == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(f"filter_eq value for field {field!r} must be a non-boolean integer or null")
+        if kind == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"filter_eq value for field {field!r} must be a boolean or null")
+    return field, value
+
+
+def _build_result(records, errors, duplicate_fields, filter_condition):
+    """Apply the equality filter to fully validated records, then counts."""
+    if filter_condition is None:
+        kept, filtered_count = records, 0
+    else:
+        field, expected = filter_condition
+        kept = [record for record in records if record[field] == expected]
+        filtered_count = len(records) - len(kept)
+    result = {"records": kept, "errors": errors, "accepted": len(kept),
+              "rejected": len(errors)}
+    if filter_condition is not None:
+        result["filtered"] = filtered_count
+    if duplicate_fields is not None:
+        result["duplicates"] = _find_duplicates(kept, duplicate_fields)
+    return result
+
+
+def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
     columns, sources = _prepare_schema(schema)
-    duplicate_fields = _prepare_duplicate_by(duplicate_by, [column["name"] for column in columns])
+    names = [column["name"] for column in columns]
+    duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
+    filter_condition = _prepare_filter_eq(filter_eq, columns)
     records, errors = [], []
     with Path(source).open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.reader(handle)
@@ -123,10 +185,7 @@ def normalize_csv(source, schema, duplicate_by=None):
                 errors.append({"row": start_line, "errors": row_errors})
             else:
                 records.append(record)
-    result = {"records": records, "errors": errors, "accepted": len(records), "rejected": len(errors)}
-    if duplicate_fields is not None:
-        result["duplicates"] = _find_duplicates(records, duplicate_fields)
-    return result
+    return _build_result(records, errors, duplicate_fields, filter_condition)
 
 
 def _convert_jsonl_value(column, value):
@@ -162,9 +221,11 @@ def _convert_jsonl_value(column, value):
     return None, f"{name}: boolean must be true or false"
 
 
-def normalize_jsonl(source, schema, duplicate_by=None):
+def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
     columns, sources = _prepare_schema(schema)
-    duplicate_fields = _prepare_duplicate_by(duplicate_by, [column["name"] for column in columns])
+    names = [column["name"] for column in columns]
+    duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
+    filter_condition = _prepare_filter_eq(filter_eq, columns)
     expected = set(sources)
     records, errors = [], []
     decoded_pairs = []
@@ -221,10 +282,7 @@ def normalize_jsonl(source, schema, duplicate_by=None):
                 errors.append({"row": row_number, "errors": row_errors})
             else:
                 records.append(record)
-    result = {"records": records, "errors": errors, "accepted": len(records), "rejected": len(errors)}
-    if duplicate_fields is not None:
-        result["duplicates"] = _find_duplicates(records, duplicate_fields)
-    return result
+    return _build_result(records, errors, duplicate_fields, filter_condition)
 
 
 def write_jsonl(path, records):
@@ -369,6 +427,8 @@ def main():
     parser.add_argument("--format", default="csv", help="input format: csv (default) or jsonl")
     parser.add_argument("--duplicate-by", action="append", metavar="FIELD",
                         help="output field to report duplicate accepted records by; repeatable")
+    parser.add_argument("--filter-eq", metavar="JSON",
+                        help='equality condition as JSON, e.g. {"field": "active", "value": true}')
     args = parser.parse_args()
     try:
         destinations = [Path(args.output).resolve(), Path(args.errors).resolve()]
@@ -377,11 +437,21 @@ def main():
             raise ValueError("output paths must be distinct from each other and inputs")
         if args.format not in ("csv", "jsonl"):
             raise ValueError("format must be csv or jsonl")
+        filter_eq = None
+        if args.filter_eq is not None:
+            try:
+                filter_eq = json.loads(args.filter_eq)
+            except ValueError as exc:
+                raise ValueError(f"filter_eq is not valid JSON: {exc}") from None
+            if not isinstance(filter_eq, dict):
+                raise ValueError("filter_eq must be a JSON object with 'field' and 'value' keys")
         normalize = normalize_csv if args.format == "csv" else normalize_jsonl
         result = normalize(args.source, json.loads(Path(args.schema).read_text(encoding="utf-8")),
-                           duplicate_by=args.duplicate_by)
+                           duplicate_by=args.duplicate_by, filter_eq=filter_eq)
         _write_jsonl_outputs_atomic(args.output, result["records"], args.errors, result["errors"])
         summary = {"accepted": result["accepted"], "rejected": result["rejected"]}
+        if args.filter_eq is not None:
+            summary["filtered"] = result["filtered"]
         if args.duplicate_by is not None:
             summary["duplicates"] = result["duplicates"]
         print(json.dumps(summary))
