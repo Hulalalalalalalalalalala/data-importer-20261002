@@ -41,6 +41,67 @@ def _prepare_defaults(columns):
     return defaults
 
 
+def _enum_field_error(name, value, allowed):
+    """Return the enum error for a converted value, or None when it is allowed.
+
+    Null is never checked: an empty optional without a default stays null
+    and membership is decided after type conversion and empty handling.
+    """
+    values = allowed.get(name)
+    if values is not None and value is not None and value not in values:
+        return f"{name}: value {value!r} is not one of allowed_values {values!r}"
+    return None
+
+
+def _prepare_allowed_values(columns, defaults):
+    """Validate the optional ``allowed_values`` list of each column.
+
+    Returns a mapping of output field name to a fresh list holding the
+    declared entries verbatim (strings are neither trimmed nor case
+    folded). The attribute must be a non-empty list of target-typed
+    values: strings for ``string`` columns, non-boolean integers for
+    ``integer`` columns, booleans for ``boolean`` columns; null, arrays
+    and objects are never valid entries, and repeated entries (value
+    equality, verbatim for strings) are refused. A processed default
+    outside the list is a configuration error even when no row needs it.
+    Raises ValueError naming ``allowed_values`` and the output field
+    before the input is read; the caller's schema is never mutated.
+    """
+    allowed = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "allowed_values" not in column:
+            continue
+        values = column["allowed_values"]
+        if not isinstance(values, list) or not values:
+            raise ValueError(
+                f"column {name!r} allowed_values {values!r} must be a non-empty list")
+        checked = []
+        for entry in values:
+            if kind == "string":
+                if not isinstance(entry, str):
+                    raise ValueError(
+                        f"column {name!r} allowed_values entry {entry!r} must be a string")
+            elif kind == "integer":
+                if isinstance(entry, bool) or not isinstance(entry, int):
+                    raise ValueError(
+                        f"column {name!r} allowed_values entry {entry!r} "
+                        "must be a non-boolean integer")
+            elif not isinstance(entry, bool):
+                raise ValueError(
+                    f"column {name!r} allowed_values entry {entry!r} must be a boolean")
+            if entry in checked:
+                raise ValueError(
+                    f"column {name!r} allowed_values entry {entry!r} is repeated")
+            checked.append(entry)
+        allowed[name] = checked
+        if name in defaults and defaults[name] not in checked:
+            raise ValueError(
+                f"column {name!r} default {defaults[name]!r} is not one of "
+                f"allowed_values {checked!r}")
+    return allowed
+
+
 def _prepare_schema(schema):
     columns = schema["columns"]
     names = [column["name"] for column in columns]
@@ -49,6 +110,7 @@ def _prepare_schema(schema):
     if any(column["type"] not in ("string", "integer", "boolean") for column in columns):
         raise ValueError("unsupported column type")
     defaults = _prepare_defaults(columns)
+    allowed = _prepare_allowed_values(columns, defaults)
     sources = []
     for column in columns:
         name = column["name"]
@@ -65,7 +127,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults
+    return columns, sources, defaults, allowed
 
 
 def _prepare_duplicate_by(duplicate_by, names):
@@ -167,7 +229,7 @@ def _build_result(records, errors, duplicate_fields, filter_condition):
 
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults = _prepare_schema(schema)
+    columns, sources, defaults, allowed = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -203,21 +265,27 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                     try:
                         if not value:
                             if name in defaults:
-                                record[name] = defaults[name]
+                                converted = defaults[name]
                             elif column.get("required", False):
                                 raise ValueError("required value is empty")
                             else:
-                                record[name] = None
+                                converted = None
                         elif kind == "integer":
-                            record[name] = int(value)
+                            converted = int(value)
                         elif kind == "boolean":
                             if value.casefold() not in ("true", "false"):
                                 raise ValueError("boolean must be true or false")
-                            record[name] = value.casefold() == "true"
+                            converted = value.casefold() == "true"
                         else:
-                            record[name] = value
+                            converted = value
                     except ValueError as exc:
                         row_errors.append(f"{name}: {exc}")
+                        continue
+                    enum_error = _enum_field_error(name, converted, allowed)
+                    if enum_error is not None:
+                        row_errors.append(enum_error)
+                    else:
+                        record[name] = converted
             if row_errors:
                 errors.append({"row": start_line, "errors": row_errors})
             else:
@@ -261,7 +329,7 @@ def _convert_jsonl_value(column, value, defaults):
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults = _prepare_schema(schema)
+    columns, sources, defaults, allowed = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -315,6 +383,10 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
                 converted, message = _convert_jsonl_value(column, obj[origin], defaults)
                 if message is not None:
                     row_errors.append(message)
+                    continue
+                enum_error = _enum_field_error(column["name"], converted, allowed)
+                if enum_error is not None:
+                    row_errors.append(enum_error)
                 else:
                     record[column["name"]] = converted
             if row_errors:
