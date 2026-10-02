@@ -10,12 +10,14 @@ from data_importer import normalize_csv, normalize_jsonl, write_jsonl
 ROOT = Path(__file__).resolve().parent
 
 
-def run_cli(source, output, errors, fmt=None, extra=()):
+def run_cli(source, output, errors, fmt=None, extra=(), output_format=None):
     command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
                "--schema", str(ROOT / "samples/schema.json"),
                "--output", str(output), "--errors", str(errors)]
     if fmt is not None:
         command += ["--format", fmt]
+    if output_format is not None:
+        command += ["--output-format", output_format]
     command += list(extra)
     return subprocess.run(command, capture_output=True, text=True)
 
@@ -2706,6 +2708,304 @@ class PathIsolationTests(unittest.TestCase):
                 self.assertFalse(output.exists() or errors.exists())
             finally:
                 locked.chmod(0o755)
+
+
+class CsvOutputTests(unittest.TestCase):
+    """--output-format csv writes exact LF-terminated CSV text while the
+    errors output stays JSONL; input format is selected independently."""
+
+    def write_file(self, directory, name, text):
+        path = Path(directory) / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def run_with_schema(self, source, schema_path, output, errors,
+                        input_format, output_format):
+        command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                   "--schema", str(schema_path), "--output", str(output),
+                   "--errors", str(errors), "--format", input_format,
+                   "--output-format", output_format]
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def test_csv_output_exact_bytes_and_jsonl_errors(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "data.csv", Path(directory) / "errors.jsonl"
+            run = run_cli(ROOT / "samples/trio.csv", output, errors,
+                          fmt="csv", output_format="csv")
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {"accepted": 2, "rejected": 1})
+            self.assertEqual(output.read_bytes(),
+                             b"name,orders,active\n"
+                             b"Maya,3,true\n"
+                             b"Omar,,false\n")
+            error_rows = [json.loads(line) for line in errors.read_text().splitlines()]
+            self.assertEqual(len(error_rows), 1)
+            self.assertEqual(error_rows[0]["row"], 4)
+            self.assertTrue(any("orders" in m for m in error_rows[0]["errors"]))
+            self.assertEqual(hidden_entries(directory), [])
+
+    def test_same_samples_csv_and_jsonl_inputs_give_identical_csv_bytes(self):
+        schema = {"columns": [
+            {"name": "label", "type": "string"},
+            {"name": "n", "type": "integer"},
+            {"name": "on", "type": "boolean", "required": True},
+        ]}
+        expected = (
+            "label,n,on\n"
+            '"中文,带逗号",3,true\n'
+            '"引号""测试",-7,false\n'
+            '"第一行\n第二行\r第三行",,true\n'
+            ",0,false\n"
+        ).encode("utf-8")
+        csv_input = expected.decode("utf-8")  # canonical text is valid input too
+        jsonl_input = "".join(
+            json.dumps(record, ensure_ascii=False) + "\n" for record in (
+                {"label": "中文,带逗号", "n": 3, "on": True},
+                {"label": '引号"测试', "n": -7, "on": False},
+                {"label": "第一行\n第二行\r第三行", "n": None, "on": True},
+                {"label": None, "n": 0, "on": False},
+            ))
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = self.write_file(directory, "schema.json",
+                                          json.dumps(schema, ensure_ascii=False))
+            csv_path = self.write_file(directory, "data.csv", csv_input)
+            jsonl_path = self.write_file(directory, "data.jsonl", jsonl_input)
+            results = []
+            for source, input_format in ((csv_path, "csv"), (jsonl_path, "jsonl")):
+                output = Path(directory) / f"out-{input_format}.csv"
+                errors = Path(directory) / f"err-{input_format}.jsonl"
+                run = self.run_with_schema(source, schema_path, output, errors,
+                                           input_format, "csv")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(errors.read_text(encoding="utf-8"), "")
+                results.append(output.read_bytes())
+        self.assertEqual(results[0], expected)
+        self.assertEqual(results[1], expected)
+
+    def test_csv_header_uses_output_names_not_sources(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True, "source": "display_name"},
+            {"name": "orders", "type": "integer", "source": "purchase_count"},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = self.write_file(directory, "schema.json", json.dumps(schema))
+            csv_path = self.write_file(
+                directory, "data.csv",
+                "display_name,purchase_count,active\nMaya,3,TRUE\n")
+            output, errors = Path(directory) / "out.csv", Path(directory) / "err.jsonl"
+            run = self.run_with_schema(csv_path, schema_path, output, errors, "csv", "csv")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(output.read_bytes(),
+                             b"name,orders,active\nMaya,3,true\n")
+
+    def test_csv_quoting_rules_single_column_empty_is_quoted(self):
+        schema = {"columns": [{"name": "f", "type": "string"}]}
+        csv_input = ('f\n'
+                     '""\n'
+                     'plain\n'
+                     '"a,b"\n'
+                     '"a""b"\n'
+                     '"a\nb"\n'
+                     '"a\rb"\n')
+        jsonl_input = "".join(
+            json.dumps({"f": value}, ensure_ascii=False) + "\n"
+            for value in (None, "plain", "a,b", 'a"b', "a\nb", "a\rb"))
+        expected = ('f\n'
+                    '""\n'
+                    'plain\n'
+                    '"a,b"\n'
+                    '"a""b"\n'
+                    '"a\nb"\n'
+                    '"a\rb"\n').encode("utf-8")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = self.write_file(directory, "schema.json", json.dumps(schema))
+            produced = []
+            for source, input_format, text in (
+                    ("data.csv", "csv", csv_input),
+                    ("data.jsonl", "jsonl", jsonl_input)):
+                path = self.write_file(directory, source, text)
+                output, errors = Path(directory) / f"out-{input_format}.csv", \
+                    Path(directory) / f"err-{input_format}.jsonl"
+                run = self.run_with_schema(path, schema_path, output, errors,
+                                           input_format, "csv")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                produced.append(output.read_bytes())
+        self.assertEqual(produced[0], expected)
+        self.assertEqual(produced[1], expected)
+
+    def test_csv_header_itself_follows_quoting_rule(self):
+        schema = {"columns": [{"name": "a,b", "type": "string"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = self.write_file(directory, "schema.json", json.dumps(schema))
+            csv_path = self.write_file(directory, "data.csv", '"a,b"\nx\n')
+            jsonl_path = self.write_file(
+                directory, "data.jsonl", json.dumps({"a,b": "x"}) + "\n")
+            for source, input_format in ((csv_path, "csv"), (jsonl_path, "jsonl")):
+                output = Path(directory) / f"out-{input_format}.csv"
+                errors = Path(directory) / f"err-{input_format}.jsonl"
+                run = self.run_with_schema(source, schema_path, output, errors,
+                                           input_format, "csv")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(output.read_bytes(), b'"a,b"\nx\n')
+
+    def test_csv_header_only_when_no_records_kept(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            # every valid record filtered out: header alone, exit 0
+            output, errors = Path(directory) / "data.csv", Path(directory) / "errors.jsonl"
+            run = run_cli(
+                ROOT / "samples/customers.csv", output, errors,
+                fmt="csv", output_format="csv",
+                extra=("--filter-eq", json.dumps({"field": "name", "value": "nobody"})))
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout),
+                             {"accepted": 0, "rejected": 0, "filtered": 2})
+            self.assertEqual(output.read_bytes(), b"name,orders,active\n")
+            self.assertEqual(errors.read_bytes(), b"")
+            # rejected rows but none accepted: still header alone, exit 1
+            source = self.write_file(
+                directory, "bad.csv", "name,orders,active\nBad,x,true\n")
+            run = run_cli(source, output, errors, fmt="csv", output_format="csv")
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {"accepted": 0, "rejected": 1})
+            self.assertEqual(output.read_bytes(), b"name,orders,active\n")
+            self.assertEqual(len(errors.read_text().splitlines()), 1)
+
+    def test_output_format_defaults_jsonl_and_is_independent_of_input(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            out, err = Path(directory) / "records.txt", Path(directory) / "errors.txt"
+            # JSONL input, flag omitted: JSONL output despite any names
+            run = run_cli(ROOT / "samples/trio.jsonl", out, err, fmt="jsonl")
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertTrue(out.read_text(encoding="utf-8").startswith("{"))
+            # CSV input with explicit jsonl output: JSONL
+            run = run_cli(ROOT / "samples/trio.csv", out, err,
+                          fmt="csv", output_format="jsonl")
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertTrue(out.read_text(encoding="utf-8").startswith("{"))
+            # JSONL input with csv output: CSV header
+            run = run_cli(ROOT / "samples/trio.jsonl", out, err,
+                          fmt="jsonl", output_format="csv")
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(out.read_text(encoding="utf-8").splitlines()[0],
+                             "name,orders,active")
+
+    def test_csv_output_is_utf8_without_bom_and_uses_lf(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "data.csv", Path(directory) / "errors.jsonl"
+            run = run_cli(ROOT / "samples/customers.csv", output, errors,
+                          fmt="csv", output_format="csv")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            data = output.read_bytes()
+            self.assertFalse(data.startswith(b"\xef\xbb\xbf"))
+            # every record terminator is LF; the samples contain no CR cells
+            self.assertNotIn(b"\r", data)
+            self.assertTrue(data.endswith(b"\n"))
+
+    def test_invalid_output_format_ordering_message_and_untouched_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_file(
+                directory, "data.csv", "name,orders,active\nMaya,3,true\n")
+            schema_path = self.write_file(
+                directory, "schema.json",
+                (ROOT / "samples/schema.json").read_text(encoding="utf-8"))
+            output, errors = Path(directory) / "out.csv", Path(directory) / "errors.jsonl"
+            # unreadable inputs are never opened: even missing paths report
+            # only the output-format error
+            missing = Path(directory) / "nope.csv"
+            missing_schema = Path(directory) / "nope.json"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(missing),
+                       "--schema", str(missing_schema), "--output", str(output),
+                       "--errors", str(errors), "--output-format", "xml"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("output-format", payload["error"])
+            self.assertIn("xml", payload["error"])
+            self.assertFalse(output.exists() or errors.exists())
+            # ... but path isolation is checked first
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(source),
+                       "--errors", str(errors), "--output-format", "xml"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("same file", json.loads(run.stdout)["error"])
+            # pre-existing outputs keep their bytes; absent ones stay absent
+            output.write_bytes(b"previous output bytes\n")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--output-format", "XML"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            payload = json.loads(run.stdout)
+            self.assertIn("output-format", payload["error"])
+            self.assertIn("XML", payload["error"])
+            self.assertEqual(output.read_bytes(), b"previous output bytes\n")
+            self.assertFalse(errors.exists())
+            # with both formats invalid, output-format is reported first
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(missing),
+                       "--schema", str(missing_schema), "--output", str(output),
+                       "--errors", str(errors), "--format", "xml",
+                       "--output-format", "yaml"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("output-format", json.loads(run.stdout)["error"])
+            self.assertEqual(output.read_bytes(), b"previous output bytes\n")
+            self.assertFalse(errors.exists())
+            self.assertEqual(hidden_entries(directory), [])
+
+    def test_csv_write_failures_keep_both_outputs_and_create_no_dirs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            # records target is a directory; errors target absent
+            output_dir = Path(directory) / "out.csv"
+            output_dir.mkdir()
+            errors = Path(directory) / "errors.jsonl"
+            run = run_cli(ROOT / "samples/trio.csv", output_dir, errors,
+                          fmt="csv", output_format="csv")
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn(str(output_dir), payload["error"])
+            self.assertTrue(output_dir.is_dir())
+            self.assertFalse(errors.exists())
+            # missing output parent: existing errors file keeps its bytes
+            missing_parent_output = Path(directory) / "nope" / "out.csv"
+            errors.write_bytes(b"old errors\n")
+            run = run_cli(ROOT / "samples/trio.csv", missing_parent_output, errors,
+                          fmt="csv", output_format="csv")
+            self.assertEqual(run.returncode, 2)
+            self.assertIn(str(missing_parent_output), json.loads(run.stdout)["error"])
+            self.assertFalse(missing_parent_output.exists())
+            self.assertFalse(Path(directory, "nope").exists())
+            self.assertEqual(errors.read_bytes(), b"old errors\n")
+            # missing errors parent: existing CSV output keeps its bytes
+            output = Path(directory) / "records.csv"
+            output.write_bytes(b"old csv\n")
+            missing_errors = Path(directory) / "dir" / "errors.jsonl"
+            run = run_cli(ROOT / "samples/trio.csv", output, missing_errors,
+                          fmt="csv", output_format="csv")
+            self.assertEqual(run.returncode, 2)
+            self.assertIn(str(missing_errors), json.loads(run.stdout)["error"])
+            self.assertEqual(output.read_bytes(), b"old csv\n")
+            self.assertFalse(Path(directory, "dir").exists())
+            self.assertEqual(hidden_entries(directory), [])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root bypasses permission bits")
+    def test_unwritable_csv_output_target_is_preserved(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "data.csv", Path(directory) / "errors.jsonl"
+            output.write_bytes(b"locked\n")
+            output.chmod(0o444)
+            try:
+                run = run_cli(ROOT / "samples/trio.csv", output, errors,
+                              fmt="csv", output_format="csv")
+                self.assertEqual(run.returncode, 2)
+                self.assertIn(str(output), json.loads(run.stdout)["error"])
+                self.assertEqual(output.read_bytes(), b"locked\n")
+                self.assertFalse(errors.exists())
+            finally:
+                output.chmod(0o644)
 
 
 if __name__ == "__main__":
