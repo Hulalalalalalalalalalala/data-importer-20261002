@@ -280,6 +280,56 @@ def _prepare_missing_values(columns):
     return missing
 
 
+def _prepare_boolean_aliases(columns):
+    """Validate the optional ``boolean_aliases`` mapping of each boolean column.
+
+    Returns a mapping of output field name to a fresh dict keyed by the
+    normalized alias text (the declared key trimmed and Unicode
+    casefolded) holding the target boolean verbatim. The attribute must be
+    a non-empty object and may appear only on a ``boolean`` column; every
+    key must be a non-blank string and every mapped value a boolean. Two
+    keys that normalize to the same text are invalid even when they map to
+    the same boolean, and a key normalizing to ``true`` or ``false`` is
+    refused so the built-in spellings keep their fixed meaning. Raises
+    ValueError naming ``boolean_aliases``, the output field and the
+    offending value before the input is read; the caller's schema is never
+    mutated.
+    """
+    aliases = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "boolean_aliases" not in column:
+            continue
+        configured = column["boolean_aliases"]
+        if kind != "boolean":
+            raise ValueError(
+                f"column {name!r} boolean_aliases {configured!r} requires a boolean column")
+        if not isinstance(configured, dict) or not configured:
+            raise ValueError(
+                f"column {name!r} boolean_aliases {configured!r} must be a non-empty object")
+        normalized = {}
+        for key, mapped in configured.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError(
+                    f"column {name!r} boolean_aliases key {key!r} must be a non-blank string")
+            if not isinstance(mapped, bool):
+                raise ValueError(
+                    f"column {name!r} boolean_aliases value {mapped!r} for key {key!r} "
+                    "must be a boolean")
+            folded = key.strip().casefold()
+            if folded in ("true", "false"):
+                raise ValueError(
+                    f"column {name!r} boolean_aliases key {key!r} must not normalize to "
+                    f"the built-in boolean spelling {folded!r}")
+            if folded in normalized:
+                raise ValueError(
+                    f"column {name!r} boolean_aliases key {key!r} normalizes to a repeated "
+                    f"key {folded!r}")
+            normalized[folded] = mapped
+        aliases[name] = normalized
+    return aliases
+
+
 def _validate_schema_structure(schema):
     """Validate the structural shape of the schema before any file is read.
 
@@ -334,6 +384,7 @@ def _prepare_schema(schema):
     defaults = _prepare_defaults(columns)
     allowed = _prepare_allowed_values(columns, defaults)
     markers = _prepare_missing_values(columns)
+    aliases = _prepare_boolean_aliases(columns)
     ranges = _prepare_ranges(columns, defaults)
     lte_fields = _prepare_lte_fields(columns)
     sources = []
@@ -352,7 +403,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, ranges, lte_fields
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields
 
 
 def _prepare_field_list(fields, names, option):
@@ -552,7 +603,7 @@ def _csv_error_reason(exc):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, ranges, lte_fields = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -620,9 +671,13 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                             elif kind == "integer":
                                 converted = int(value)
                             elif kind == "boolean":
-                                if value.casefold() not in ("true", "false"):
+                                folded = value.casefold()
+                                if folded in ("true", "false"):
+                                    converted = folded == "true"
+                                elif folded in aliases.get(name, ()):
+                                    converted = aliases[name][folded]
+                                else:
                                     raise ValueError("boolean must be true or false")
-                                converted = value.casefold() == "true"
                             else:
                                 converted = value
                         except ValueError as exc:
@@ -657,7 +712,7 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                          deduplicate_fields)
 
 
-def _convert_jsonl_value(column, value, defaults, markers):
+def _convert_jsonl_value(column, value, defaults, markers, aliases):
     """Convert one decoded JSON value. Returns (converted, error_message)."""
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
@@ -694,12 +749,15 @@ def _convert_jsonl_value(column, value, defaults, markers):
         folded = value.casefold()
         if folded in ("true", "false"):
             return folded == "true", None
+        column_aliases = aliases.get(name)
+        if column_aliases is not None and folded in column_aliases:
+            return column_aliases[folded], None
     return None, f"{name}: boolean must be true or false"
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, ranges, lte_fields = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -757,7 +815,7 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
             field_error_names = set()
             for index, (column, origin) in enumerate(zip(columns, sources)):
                 name = column["name"]
-                converted, message = _convert_jsonl_value(column, obj[origin], defaults, markers)
+                converted, message = _convert_jsonl_value(column, obj[origin], defaults, markers, aliases)
                 if message is not None:
                     slots[index].append(message)
                     field_error_names.add(name)
