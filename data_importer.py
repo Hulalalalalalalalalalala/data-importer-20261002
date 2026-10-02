@@ -2,6 +2,9 @@
 import argparse
 import csv
 import json
+import os
+import stat
+import tempfile
 from pathlib import Path
 
 
@@ -224,8 +227,127 @@ def normalize_jsonl(source, schema, duplicate_by=None):
     return result
 
 
+def _encode_jsonl(records):
+    return "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records)
+
+
 def write_jsonl(path, records):
-    Path(path).write_text("".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records), encoding="utf-8")
+    Path(path).write_text(_encode_jsonl(records), encoding="utf-8")
+
+
+def _check_destination(path):
+    """Validate one output target before any file is created or moved.
+
+    Raises OSError naming the target when it is an existing directory, when
+    its parent directory is missing, or when the location is not writable.
+    Parent directories are never created.
+    """
+    if path.is_dir():
+        raise IsADirectoryError(f"cannot write output to {path}: target is a directory")
+    parent = path.parent
+    if not parent.is_dir():
+        raise FileNotFoundError(f"cannot write output to {path}: parent directory does not exist")
+    if not os.access(parent, os.W_OK):
+        raise PermissionError(f"cannot write output to {path}: directory is not writable")
+    if path.exists() and not os.access(path, os.W_OK):
+        raise PermissionError(f"cannot write output to {path}: file is not writable")
+
+
+def _reserve_path(path, suffix):
+    """Reserve and return a unique temporary name next to path."""
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=suffix)
+    os.close(descriptor)
+    return Path(name)
+
+
+def _export_outputs(output_path, errors_path, records, row_errors):
+    """Replace both output targets or leave both exactly as they were.
+
+    Payloads are staged in the target directories first; existing targets are
+    then moved aside and the staged files renamed into place. A failure at any
+    point restores the originals (and removes newly created targets), so a
+    run ends with both files replaced or with both targets unchanged.
+    """
+    targets = [output_path, errors_path]
+    payloads = [_encode_jsonl(records).encode("utf-8"),
+                _encode_jsonl(row_errors).encode("utf-8")]
+    umask = os.umask(0)
+    os.umask(umask)
+    default_mode = 0o666 & ~umask
+    # Preflight both targets before touching anything: a directory target, a
+    # missing parent or an unwritable location fails with no side effects.
+    for target in targets:
+        _check_destination(target)
+    staged = []
+    reserved = []
+    try:
+        for target, payload in zip(targets, payloads):
+            try:
+                descriptor, name = tempfile.mkstemp(
+                    dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+                staged.append(Path(name))
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                raise OSError(f"failed to write output {target}: {exc}") from exc
+        backups = [None, None]
+        modes = [None, None]
+        moved = []
+        committed = []
+        try:
+            for index, target in enumerate(targets):
+                if target.exists():
+                    # Preserve the permissions write_text() would have kept
+                    # when truncating an existing file.
+                    modes[index] = stat.S_IMODE(target.stat().st_mode)
+                    backup = _reserve_path(target, ".bak")
+                    reserved.append((index, backup))
+                    os.replace(target, backup)
+                    backups[index] = backup
+                    moved.append(index)
+            for index, (target, tmp) in enumerate(zip(targets, staged)):
+                os.chmod(tmp, modes[index] if modes[index] is not None else default_mode)
+                os.replace(tmp, target)
+                committed.append(index)
+        except OSError as exc:
+            failed = target
+            # Put every moved-aside original back; targets it overwrote or
+            # created are removed first. A restored backup drops out of
+            # reserved so a failed restore leaves the .bak recoverable.
+            for index in moved:
+                try:
+                    targets[index].unlink(missing_ok=True)
+                    os.replace(backups[index], targets[index])
+                    reserved = [(i, name) for i, name in reserved if i != index]
+                except OSError:
+                    pass
+            # A target that did not exist beforehand must stay absent.
+            for index in committed:
+                if index not in moved:
+                    try:
+                        targets[index].unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            raise OSError(f"failed to write output {failed}: {exc}") from exc
+        # Both staged files are in place; the moved-aside originals go away.
+        for _, backup in reserved:
+            backup.unlink(missing_ok=True)
+        reserved.clear()
+    finally:
+        for tmp in staged:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        # Only empty reservations whose move never happened land here.
+        for _, backup in reserved:
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def main():
@@ -248,8 +370,7 @@ def main():
         normalize = normalize_csv if args.format == "csv" else normalize_jsonl
         result = normalize(args.source, json.loads(Path(args.schema).read_text(encoding="utf-8")),
                            duplicate_by=args.duplicate_by)
-        write_jsonl(args.output, result["records"])
-        write_jsonl(args.errors, result["errors"])
+        _export_outputs(Path(args.output), Path(args.errors), result["records"], result["errors"])
         summary = {"accepted": result["accepted"], "rejected": result["rejected"]}
         if args.duplicate_by is not None:
             summary["duplicates"] = result["duplicates"]

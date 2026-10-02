@@ -1,10 +1,13 @@
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from data_importer import normalize_csv, normalize_jsonl
+from unittest import mock
+from data_importer import normalize_csv, normalize_jsonl, _export_outputs
 
 ROOT = Path(__file__).resolve().parent
 
@@ -562,6 +565,191 @@ class JsonlImporterTests(unittest.TestCase):
                 ]})
             self.assertEqual(len(output.read_text().splitlines()), 4)
             self.assertEqual(errors.read_text(encoding="utf-8"), "")
+
+
+class AtomicExportTests(unittest.TestCase):
+    SAMPLES = {
+        "csv": ROOT / "samples/two_valid_one_bad.csv",
+        "jsonl": ROOT / "samples/two_valid_one_bad.jsonl",
+    }
+
+    def run_cli(self, fmt, output, errors):
+        command = [sys.executable, str(ROOT / "data_importer.py"), str(self.SAMPLES[fmt]),
+                   "--schema", str(ROOT / "samples/schema.json"),
+                   "--output", str(output), "--errors", str(errors)]
+        if fmt != "csv":
+            command.extend(["--format", fmt])
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def assertSummaryOnly(self, run):
+        lines = [line for line in run.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, run.stdout)
+        return json.loads(lines[0])
+
+    def assertExportedPayloads(self, output, errors, fmt):
+        records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(records, [
+            {"name": "Maya", "orders": 3, "active": True},
+            {"name": "Omar", "orders": 5, "active": False},
+        ])
+        row_errors = [json.loads(line) for line in errors.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(row_errors), 1)
+        # CSV header occupies physical line 1; JSONL starts records at line 1.
+        self.assertEqual(row_errors[0]["row"], 4 if fmt == "csv" else 3)
+        self.assertEqual(row_errors[0]["errors"][0].split(":", 1)[0], "orders")
+
+    def test_success_both_formats_replaces_targets(self):
+        for fmt in ("csv", "jsonl"):
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+                output.write_text("old output\n", encoding="utf-8")
+                errors.write_text("old errors\n", encoding="utf-8")
+                run = self.run_cli(fmt, output, errors)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                payload = self.assertSummaryOnly(run)
+                self.assertEqual(payload, {"accepted": 2, "rejected": 1})
+                self.assertExportedPayloads(output, errors, fmt)
+
+    def test_errors_parent_missing_keeps_existing_output(self):
+        for fmt in ("csv", "jsonl"):
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                output = Path(directory) / "data.jsonl"
+                missing_parent = Path(directory) / "nodir"
+                errors = missing_parent / "errors.jsonl"
+                original = b"\xff\xfeold output bytes\x00\n"
+                output.write_bytes(original)
+                run = self.run_cli(fmt, output, errors)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = self.assertSummaryOnly(run)
+                self.assertIsInstance(payload["error"], str)
+                self.assertTrue(payload["error"].strip())
+                self.assertIn(str(errors), payload["error"])
+                self.assertEqual(output.read_bytes(), original)
+                self.assertFalse(errors.exists())
+                self.assertFalse(missing_parent.exists())
+
+    def test_errors_parent_missing_output_absent_stays_absent(self):
+        for fmt in ("csv", "jsonl"):
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                output = Path(directory) / "data.jsonl"
+                errors = Path(directory) / "nodir" / "errors.jsonl"
+                run = self.run_cli(fmt, output, errors)
+                self.assertEqual(run.returncode, 2)
+                self.assertIn("error", json.loads(run.stdout))
+                self.assertFalse(output.exists())
+                self.assertFalse(errors.exists())
+
+    def test_output_parent_missing_same_rule(self):
+        for fmt in ("csv", "jsonl"):
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                output = Path(directory) / "nodir" / "data.jsonl"
+                errors = Path(directory) / "errors.jsonl"
+                original = b"keep these row errors\n"
+                errors.write_bytes(original)
+                run = self.run_cli(fmt, output, errors)
+                self.assertEqual(run.returncode, 2)
+                payload = self.assertSummaryOnly(run)
+                self.assertIn(str(output), payload["error"])
+                self.assertEqual(errors.read_bytes(), original)
+                self.assertFalse(output.exists())
+                self.assertFalse(Path(directory, "nodir").exists())
+                # and when the errors target is absent too, both stay absent
+                errors.unlink()
+                run = self.run_cli(fmt, output, errors)
+                self.assertEqual(run.returncode, 2)
+                self.assertFalse(output.exists())
+                self.assertFalse(errors.exists())
+
+    def test_target_is_directory_leaves_both_untouched(self):
+        for failing in ("output", "errors"):
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                output = Path(directory) / ("outdir" if failing == "output" else "data.jsonl")
+                errors = Path(directory) / ("errdir" if failing == "errors" else "errors.jsonl")
+                target = output if failing == "output" else errors
+                target.mkdir()
+                other = errors if failing == "output" else output
+                original = b"do not touch me\n"
+                other.write_bytes(original)
+                run = self.run_cli("csv", output, errors)
+                self.assertEqual(run.returncode, 2)
+                payload = self.assertSummaryOnly(run)
+                self.assertIn(str(target), payload["error"])
+                self.assertTrue(target.is_dir())
+                self.assertEqual(other.read_bytes(), original)
+
+    def test_unwritable_directory_fails_without_changes(self):
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory write permissions")
+        directory = tempfile.mkdtemp(dir=ROOT)
+        try:
+            os.chmod(directory, 0o555)
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            run = self.run_cli("csv", output, errors)
+            self.assertEqual(run.returncode, 2)
+            payload = self.assertSummaryOnly(run)
+            self.assertTrue(payload["error"].strip())
+            self.assertFalse(output.exists())
+            self.assertFalse(errors.exists())
+        finally:
+            os.chmod(directory, 0o755)
+            shutil.rmtree(directory)
+
+    def test_inputs_and_source_files_unchanged_after_failure(self):
+        for name in ("samples/two_valid_one_bad.csv", "samples/schema.json"):
+            path = ROOT / name
+            before = path.read_bytes()
+            with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+                self.run_cli("csv", Path(tmp) / "data.jsonl", Path(tmp) / "nodir" / "errors.jsonl")
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_rollback_when_second_commit_fails(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output_original = b"\x00\x01 output original \xff\n"
+            errors_original = b"\x02 errors original\n"
+            output.write_bytes(output_original)
+            errors.write_bytes(errors_original)
+            real_replace = os.replace
+
+            def fail_on_errors(src, dst, *args, **kwargs):
+                if Path(dst) == errors and str(src).endswith(".tmp"):
+                    raise OSError("simulated rename failure")
+                return real_replace(src, dst, *args, **kwargs)
+
+            with mock.patch("data_importer.os.replace", side_effect=fail_on_errors):
+                with self.assertRaises(OSError) as caught:
+                    _export_outputs(output, errors, [{"a": 1}], [{"row": 4}])
+            self.assertIn(str(errors), str(caught.exception))
+            self.assertEqual(output.read_bytes(), output_original)
+            self.assertEqual(errors.read_bytes(), errors_original)
+            leftovers = [p.name for p in Path(directory).iterdir()]
+            self.assertEqual(sorted(leftovers), ["data.jsonl", "errors.jsonl"])
+
+    def test_rollback_when_first_commit_fails_absent_target(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            errors_original = b"errors stay here\n"
+            errors.write_bytes(errors_original)
+            real_replace = os.replace
+
+            def fail_on_output(src, dst, *args, **kwargs):
+                if Path(dst) == output:
+                    raise OSError("simulated rename failure")
+                return real_replace(src, dst, *args, **kwargs)
+
+            with mock.patch("data_importer.os.replace", side_effect=fail_on_output):
+                with self.assertRaises(OSError):
+                    _export_outputs(output, errors, [{"a": 1}], [])
+            self.assertFalse(output.exists())
+            self.assertEqual(errors.read_bytes(), errors_original)
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["errors.jsonl"])
+
+    def test_success_creates_absent_targets_including_empty_errors(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            _export_outputs(output, errors, [], [])
+            self.assertEqual(output.read_bytes(), b"")
+            self.assertEqual(errors.read_bytes(), b"")
 
 
 if __name__ == "__main__":

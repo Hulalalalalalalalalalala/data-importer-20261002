@@ -1,0 +1,3 @@
+{"name": "Maya", "orders": 3, "active": true}
+{"name": "Omar", "orders": 5, "active": false}
+{"name": "Ivy", "orders": "many", "active": true}
