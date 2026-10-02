@@ -102,13 +102,57 @@ def _prepare_allowed_values(columns, defaults):
     return allowed
 
 
-def _prepare_schema(schema):
+def _validate_schema_structure(schema):
+    """Validate the structural shape of the schema before any file is read.
+
+    The schema must be an object holding a non-empty ``columns`` list;
+    each column must be an object carrying ``name`` (a non-blank string,
+    kept verbatim -- never trimmed -- and unique case-sensitively) and
+    ``type`` (one of ``string``, ``integer``, ``boolean``), plus an
+    optional ``required`` that, when present, must be a boolean. Checks
+    run top level first, then column by column in order (column
+    structure, name, duplicate name, type, required) and only the first
+    problem is reported: the ValueError message names ``schema`` and the
+    one-based column position, names a missing key, carries the
+    offending value verbatim, and points a duplicate name at the later
+    column. Unknown attributes are ignored and the caller's schema is
+    never mutated.
+    """
+    if not isinstance(schema, dict):
+        raise ValueError(f"schema must be an object, got {schema!r}")
+    if "columns" not in schema:
+        raise ValueError("schema is missing 'columns'")
     columns = schema["columns"]
-    names = [column["name"] for column in columns]
-    if not names or len(set(names)) != len(names):
-        raise ValueError("schema column names must be nonempty and unique")
-    if any(column["type"] not in ("string", "integer", "boolean") for column in columns):
-        raise ValueError("unsupported column type")
+    if not isinstance(columns, list) or not columns:
+        raise ValueError(f"schema 'columns' must be a non-empty list, got {columns!r}")
+    seen = {}
+    for index, column in enumerate(columns, start=1):
+        if not isinstance(column, dict):
+            raise ValueError(f"schema column {index} must be an object, got {column!r}")
+        for key in ("name", "type"):
+            if key not in column:
+                raise ValueError(f"schema column {index} is missing {key!r}")
+        name = column["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"schema column {index} name {name!r} must be a non-blank string")
+        if name in seen:
+            raise ValueError(
+                f"schema column {index} name {name!r} duplicates column {seen[name]}")
+        seen[name] = index
+        kind = column["type"]
+        if kind not in ("string", "integer", "boolean"):
+            raise ValueError(
+                f"schema column {index} type {kind!r} must be one of "
+                "'string', 'integer', 'boolean'")
+        if "required" in column and not isinstance(column["required"], bool):
+            raise ValueError(
+                f"schema column {index} required {column['required']!r} must be a boolean")
+
+
+def _prepare_schema(schema):
+    _validate_schema_structure(schema)
+    columns = schema["columns"]
     defaults = _prepare_defaults(columns)
     allowed = _prepare_allowed_values(columns, defaults)
     sources = []
