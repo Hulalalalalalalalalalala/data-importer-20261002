@@ -5,16 +5,30 @@ import csv
 import json
 import os
 import tempfile
+import unicodedata
 from pathlib import Path
 
 
-def _prepare_defaults(columns):
+def _nfkc(value):
+    """Apply Unicode NFKC normalization and trim the result.
+
+    The extra trim handles padding produced by the normalization itself
+    (equivalent text whose NFKC form starts or ends with whitespace even
+    though the source string did not).
+    """
+    return unicodedata.normalize("NFKC", value).strip()
+
+
+def _prepare_defaults(columns, normalization):
     """Validate the optional target-typed ``default`` of each column.
 
     Returns a mapping of output field name to the processed default
-    (string defaults are trimmed). A malformed default is a configuration
-    error naming the default value and output field, raised before the
-    input is read; the caller's schema dicts are never mutated.
+    (string defaults are trimmed, and additionally NFKC-normalized when
+    the column declares ``unicode_normalization: "NFKC"``). A malformed
+    default is a configuration error naming the default value and output
+    field, raised before the input is read; a string default whose
+    normalized form is empty is refused the same way. The caller's
+    schema dicts are never mutated.
     """
     defaults = {}
     for column in columns:
@@ -25,7 +39,10 @@ def _prepare_defaults(columns):
         if kind == "string":
             if not isinstance(default, str):
                 raise ValueError(f"column {name!r} default {default!r} must be a string")
-            processed = default.strip()
+            if name in normalization:
+                processed = _nfkc(default)
+            else:
+                processed = default.strip()
             if not processed:
                 raise ValueError(f"column {name!r} default {default!r} must not be blank")
             defaults[name] = processed
@@ -378,10 +395,40 @@ def _validate_schema_structure(schema):
                 f"schema column {index} required {column['required']!r} must be a boolean")
 
 
+def _prepare_unicode_normalization(columns):
+    """Validate the optional per-column ``unicode_normalization`` attribute.
+
+    Returns a set of output field names on which normalization is
+    enabled. The attribute may appear only on a ``string`` column and,
+    when present, must be the exact, case-sensitive string ``"NFKC"``:
+    any other value (including ``"nfkc"`` or ``"NFC"``), a non-string,
+    or declaration on an ``integer``/``boolean`` column is a
+    configuration error. Raises ValueError naming
+    ``unicode_normalization``, the output field and the offending value
+    before the input is read; the caller's schema is never mutated.
+    """
+    normalized = set()
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "unicode_normalization" not in column:
+            continue
+        setting = column["unicode_normalization"]
+        if kind != "string":
+            raise ValueError(
+                f"column {name!r} unicode_normalization {setting!r} requires a string column")
+        if not isinstance(setting, str) or setting != "NFKC":
+            raise ValueError(
+                f"column {name!r} unicode_normalization {setting!r} must be the exact "
+                "string 'NFKC'")
+        normalized.add(name)
+    return normalized
+
+
 def _prepare_schema(schema):
     _validate_schema_structure(schema)
     columns = schema["columns"]
-    defaults = _prepare_defaults(columns)
+    normalization = _prepare_unicode_normalization(columns)
+    defaults = _prepare_defaults(columns, normalization)
     allowed = _prepare_allowed_values(columns, defaults)
     markers = _prepare_missing_values(columns)
     aliases = _prepare_boolean_aliases(columns)
@@ -403,7 +450,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalization
 
 
 def _prepare_field_list(fields, names, option):
@@ -603,7 +650,7 @@ def _csv_error_reason(exc):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalization = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -661,6 +708,13 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                             # flow: default, required error or null.
                             value = ""
                         try:
+                            if value and kind == "string" and name in normalization:
+                                # NFKC runs after trimming and marker
+                                # matching: markers are never rematched on
+                                # the normalized text, and a value that
+                                # normalizes to empty re-enters the
+                                # empty-value flow below.
+                                value = _nfkc(value)
                             if not value:
                                 if name in defaults:
                                     converted = defaults[name]
@@ -712,7 +766,7 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                          deduplicate_fields)
 
 
-def _convert_jsonl_value(column, value, defaults, markers, aliases):
+def _convert_jsonl_value(column, value, defaults, markers, aliases, normalization):
     """Convert one decoded JSON value. Returns (converted, error_message)."""
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
@@ -722,6 +776,13 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases):
             # booleans, arrays and objects never do); a hit follows the
             # empty-value flow before any type conversion.
             value = ""
+    if (kind == "string" and name in normalization
+            and isinstance(value, str) and value):
+        # NFKC runs after trimming and marker matching and is applied
+        # only to string columns: markers are never rematched, non-string
+        # JSON values keep their ordinary type error, and text that
+        # normalizes to empty falls through into the empty-value flow.
+        value = _nfkc(value)
     if value is None or value == "":
         if name in defaults:
             return defaults[name], None
@@ -757,7 +818,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases):
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalization = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -815,7 +876,8 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
             field_error_names = set()
             for index, (column, origin) in enumerate(zip(columns, sources)):
                 name = column["name"]
-                converted, message = _convert_jsonl_value(column, obj[origin], defaults, markers, aliases)
+                converted, message = _convert_jsonl_value(
+                    column, obj[origin], defaults, markers, aliases, normalization)
                 if message is not None:
                     slots[index].append(message)
                     field_error_names.add(name)
