@@ -6,6 +6,7 @@ Start
 python3 data_importer.py samples/customers.csv --schema samples/schema.json --output customers.jsonl --errors errors.jsonl
 Prints accepted 2 and rejected 0; writes two JSONL rows.
 Add --format jsonl (e.g. with samples/customers.jsonl) to process JSONL; the default is csv and the extension is never inferred.
+Add --output-format csv to write the kept records to --output as CSV (header plus kept rows) instead of JSONL; the default is jsonl, --errors always stays JSONL, and neither format flag is inferred from file extensions.
 
 Smoke Test
 python3 -B -m unittest -v

@@ -2708,5 +2708,204 @@ class PathIsolationTests(unittest.TestCase):
                 locked.chmod(0o755)
 
 
+class CsvOutputFormatTests(unittest.TestCase):
+    """--output-format csv writes kept records as CSV; --errors stays JSONL."""
+
+    def setUp(self):
+        self.schema = json.loads((ROOT / "samples/schema.json").read_text())
+
+    def write_file(self, directory, name, text):
+        path = Path(directory) / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def run_csv(self, source, output, errors, fmt=None, extra=(), schema_path=None):
+        command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                   "--schema", str(schema_path or ROOT / "samples/schema.json"),
+                   "--output", str(output), "--errors", str(errors),
+                   "--output-format", "csv"]
+        if fmt is not None:
+            command += ["--format", fmt]
+        command += list(extra)
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def test_csv_output_exact_bytes_and_jsonl_errors(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "out.csv", Path(directory) / "err.jsonl"
+            run = self.run_csv(ROOT / "samples/mixed.csv", output, errors)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {"accepted": 1, "rejected": 2})
+            self.assertEqual(output.read_bytes(), b"name,orders,active\nMaya,3,true\n")
+            error_lines = errors.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(error_lines), 2)
+            self.assertEqual([json.loads(line)["row"] for line in error_lines], [3, 4])
+
+    def test_csv_output_escaping_types_and_lf_endings(self):
+        schema_path_text = json.dumps({"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "note", "type": "string"},
+            {"name": "orders", "type": "integer"},
+            {"name": "active", "type": "boolean"},
+        ]})
+        record = {"name": "李,雷", "note": '说"你\r\n好"', "orders": -7, "active": False}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_file(directory, "data.jsonl", json.dumps(record, ensure_ascii=False) + "\n")
+            schema_path = self.write_file(directory, "schema.json", schema_path_text)
+            output, errors = Path(directory) / "out.csv", Path(directory) / "err.jsonl"
+            run = self.run_csv(source, output, errors, fmt="jsonl", schema_path=schema_path)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            payload = output.read_bytes()
+        expected = 'name,note,orders,active\n"李,雷","说""你\r\n好""",-7,false\n'.encode("utf-8")
+        self.assertEqual(payload, expected)
+        self.assertFalse(payload.startswith(b"\xef\xbb\xbf"))
+
+    def test_csv_output_header_uses_output_names_not_sources(self):
+        mapped = {"columns": [
+            {"name": "name", "type": "string", "required": True, "source": "display_name"},
+            {"name": "orders", "type": "integer", "source": "purchase_count"},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_file(directory, "data.csv",
+                                     "display_name,purchase_count,active\nMaya,3,TRUE\n")
+            schema_path = self.write_file(directory, "schema.json", json.dumps(mapped))
+            output, errors = Path(directory) / "out.csv", Path(directory) / "err.jsonl"
+            run = self.run_csv(source, output, errors, schema_path=schema_path)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(output.read_bytes(), b"name,orders,active\nMaya,3,true\n")
+
+    def test_csv_output_single_column_null_is_quoted_empty(self):
+        schema_path_text = json.dumps({"columns": [{"name": "orders", "type": "integer"}]})
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_file(directory, "data.csv", "orders\n \n3\n")
+            schema_path = self.write_file(directory, "schema.json", schema_path_text)
+            output, errors = Path(directory) / "out.csv", Path(directory) / "err.jsonl"
+            run = self.run_csv(source, output, errors, schema_path=schema_path)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(output.read_bytes(), b'orders\n""\n3\n')
+
+    def test_csv_output_header_only_when_nothing_kept(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "out.csv", Path(directory) / "err.jsonl"
+            run = self.run_csv(ROOT / "samples/customers.csv", output, errors,
+                               extra=("--filter-eq", json.dumps({"field": "name", "value": "nobody"})))
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout),
+                             {"accepted": 0, "rejected": 0, "filtered": 2})
+            self.assertEqual(output.read_bytes(), b"name,orders,active\n")
+            self.assertEqual(errors.read_bytes(), b"")
+
+    def test_csv_output_byte_identical_across_input_formats(self):
+        csv_text = 'name,orders,active\n"李,雷",3,true\n"说""话""",,false\n'
+        jsonl_text = ('{"name": "李,雷", "orders": 3, "active": true}\n'
+                      '{"name": "说\\"话\\"", "orders": null, "active": false}\n')
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_source = self.write_file(directory, "data.csv", csv_text)
+            jsonl_source = self.write_file(directory, "data.jsonl", jsonl_text)
+            csv_out = Path(directory) / "from_csv.csv"
+            jsonl_out = Path(directory) / "from_jsonl.csv"
+            run_csv_in = self.run_csv(csv_source, csv_out, Path(directory) / "e1.jsonl")
+            run_jsonl_in = self.run_csv(jsonl_source, jsonl_out, Path(directory) / "e2.jsonl",
+                                        fmt="jsonl")
+            self.assertEqual(run_csv_in.returncode, 0, run_csv_in.stderr)
+            self.assertEqual(run_jsonl_in.returncode, 0, run_jsonl_in.stderr)
+            self.assertEqual(csv_out.read_bytes(), jsonl_out.read_bytes())
+            self.assertEqual(csv_out.read_bytes(),
+                             'name,orders,active\n"李,雷",3,true\n"说""话""",,false\n'
+                             .encode("utf-8"))
+
+    def test_csv_output_summary_and_exit_codes_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_file(
+                directory, "data.csv",
+                "name,orders,active\na,3,true\nb,3,false\nc,3,true\nbad,x,true\n")
+            output, errors = Path(directory) / "out.csv", Path(directory) / "err.jsonl"
+            run = self.run_csv(source, output, errors,
+                               extra=("--duplicate-by", "orders",
+                                      "--filter-eq", json.dumps({"field": "active", "value": True})))
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {
+                "accepted": 2, "rejected": 1, "filtered": 1,
+                "duplicates": [{"key": {"orders": 3}, "record_numbers": [1, 2]}],
+            })
+            self.assertEqual(output.read_bytes(), b"name,orders,active\na,3,true\nc,3,true\n")
+
+    def test_default_and_explicit_jsonl_output_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for extra in ((), ("--output-format", "jsonl")):
+                output, errors = Path(directory) / "out.jsonl", Path(directory) / "err.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"),
+                           str(ROOT / "samples/customers.csv"),
+                           "--schema", str(ROOT / "samples/schema.json"),
+                           "--output", str(output), "--errors", str(errors), *extra]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                lines = output.read_text(encoding="utf-8").splitlines()
+                self.assertEqual([json.loads(line) for line in lines], [
+                    {"active": True, "name": "Maya", "orders": 3},
+                    {"active": False, "name": "Omar", "orders": None},
+                ])
+                output.unlink()
+                errors.unlink()
+
+    def test_invalid_output_format_exit_two_before_reading_inputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output = Path(directory) / "out.csv"
+            errors = Path(directory) / "err.jsonl"
+            output.write_bytes(b"keep me\n")
+            missing_source = Path(directory) / "does-not-exist.csv"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(missing_source),
+                       "--schema", str(ROOT / "samples/schema.json"),
+                       "--output", str(output), "--errors", str(errors),
+                       "--output-format", "xml"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("output-format", payload["error"])
+            self.assertIn("xml", payload["error"])
+            self.assertEqual(output.read_bytes(), b"keep me\n")
+            self.assertFalse(errors.exists())
+
+    def test_path_isolation_still_checked_before_output_format(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_file(directory, "data.csv", "name,orders,active\nA,3,true\n")
+            errors = Path(directory) / "err.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(ROOT / "samples/schema.json"),
+                       "--output", str(source), "--errors", str(errors),
+                       "--output-format", "xml"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertIn("paths must be distinct", payload["error"])
+            self.assertNotIn("output-format", payload["error"])
+            self.assertEqual(source.read_text(encoding="utf-8"), "name,orders,active\nA,3,true\n")
+            self.assertFalse(errors.exists())
+
+    def test_csv_output_commit_failure_preserves_both_targets(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output = Path(directory) / "out.csv"
+            errors = Path(directory) / "err.jsonl"
+            output.write_bytes(b"previous output\n")
+            errors.write_bytes(b"previous errors\n")
+            output_dir = Path(directory) / "a-directory"
+            output_dir.mkdir()
+            # a directory target fails; both pre-existing files keep their bytes
+            run = self.run_csv(ROOT / "samples/customers.csv", output_dir, errors)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn(str(output_dir), payload["error"])
+            self.assertEqual(errors.read_bytes(), b"previous errors\n")
+            # a missing errors parent fails too; the output keeps its bytes
+            run = self.run_csv(ROOT / "samples/customers.csv", output,
+                               Path(directory) / "no-such-dir" / "err.jsonl")
+            self.assertEqual(run.returncode, 2, run.stderr)
+            self.assertEqual(output.read_bytes(), b"previous output\n")
+            self.assertFalse((Path(directory) / "no-such-dir").exists())
+            self.assertEqual(hidden_entries(directory), [])
+
+
 if __name__ == "__main__":
     unittest.main()

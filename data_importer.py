@@ -615,12 +615,70 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
     return _build_result(records, errors, duplicate_fields, filter_condition)
 
 
+def _jsonl_payload(records):
+    """Serialize records as JSONL text: sorted keys, one LF-ended line each."""
+    return "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                   for record in records)
+
+
 def write_jsonl(path, records):
-    Path(path).write_text("".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records), encoding="utf-8")
+    Path(path).write_text(_jsonl_payload(records), encoding="utf-8")
 
 
-def _stage_jsonl(destination, records):
-    """Serialize records into a temp file in the destination's directory.
+def _csv_escape_cell(text):
+    """Quote one CSV cell exactly when its content requires it.
+
+    A cell containing a comma, a double quote, CR or LF is wrapped in
+    double quotes with each inner double quote doubled; every other cell
+    is emitted bare. Header names and data cells share this rule.
+    """
+    if any(marker in text for marker in (",", '"', "\r", "\n")):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def _csv_cell_text(value):
+    """Render one normalized value as CSV cell text.
+
+    Integers become decimal text, booleans lowercase ``true``/``false``,
+    null an empty cell and strings their normalized content verbatim,
+    inner newlines included.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    return value
+
+
+def _csv_payload(columns, records):
+    """Serialize kept records as a CSV document payload (UTF-8, no BOM).
+
+    The header carries the output field names in schema declaration
+    order -- never source aliases -- and is always present, even when no
+    record is kept; the header and every data line end with LF. A
+    single-column empty cell is written as a quoted empty string so the
+    line still holds one field.
+    """
+    names = [column["name"] for column in columns]
+    single_column = len(names) == 1
+    lines = [",".join(_csv_escape_cell(name) for name in names)]
+    for record in records:
+        cells = []
+        for name in names:
+            text = _csv_cell_text(record[name])
+            if single_column and not text:
+                cells.append('""')
+            else:
+                cells.append(_csv_escape_cell(text))
+        lines.append(",".join(cells))
+    return "\n".join(lines) + "\n"
+
+
+def _stage_payload(destination, payload):
+    """Serialize payload into a temp file in the destination's directory.
 
     Parent directories are never created and the destination is not
     touched. Returns (staged_path, existed); raised OSError names the
@@ -634,7 +692,6 @@ def _stage_jsonl(destination, records):
         raise OSError(f"cannot write {target}: target is a directory")
     if target.exists() and not os.access(target, os.W_OK):
         raise OSError(f"cannot write {target}: target is not writable")
-    payload = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records)
     try:
         handle, staged_name = tempfile.mkstemp(
             prefix=f".{target.name}.", suffix=".tmp", dir=parent)
@@ -707,8 +764,8 @@ def _install_staged(target, staged, existed):
     return backup
 
 
-def _write_jsonl_outputs_atomic(output_path, records, errors_path, errors):
-    """Write both JSONL outputs as one all-or-nothing operation.
+def _write_outputs_atomic(output_path, output_payload, errors_path, errors_payload):
+    """Write both outputs as one all-or-nothing operation.
 
     Either both files are fully written (replacing existing files), or a
     filesystem failure leaves every target exactly as it was beforehand:
@@ -716,9 +773,9 @@ def _write_jsonl_outputs_atomic(output_path, records, errors_path, errors):
     absent. Parent directories are never created.
     """
     output_target, errors_target = Path(output_path), Path(errors_path)
-    staged_output, output_existed = _stage_jsonl(output_target, records)
+    staged_output, output_existed = _stage_payload(output_target, output_payload)
     try:
-        staged_errors, errors_existed = _stage_jsonl(errors_target, errors)
+        staged_errors, errors_existed = _stage_payload(errors_target, errors_payload)
     except BaseException:
         with contextlib.suppress(OSError):
             staged_output.unlink()
@@ -815,6 +872,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--errors", required=True)
     parser.add_argument("--format", default="csv", help="input format: csv (default) or jsonl")
+    parser.add_argument("--output-format", default="jsonl",
+                        help="records output format: jsonl (default) or csv")
     parser.add_argument("--duplicate-by", action="append", metavar="FIELD",
                         help="output field to report duplicate accepted records by; repeatable")
     parser.add_argument("--filter-eq", metavar="JSON",
@@ -824,6 +883,9 @@ def main():
         _check_path_isolation(args.source, args.schema, args.output, args.errors)
         if args.format not in ("csv", "jsonl"):
             raise ValueError("format must be csv or jsonl")
+        if args.output_format not in ("csv", "jsonl"):
+            raise ValueError(
+                f"output-format must be csv or jsonl, got {args.output_format!r}")
         filter_eq = None
         if args.filter_eq is not None:
             try:
@@ -833,9 +895,15 @@ def main():
             if not isinstance(filter_eq, dict):
                 raise ValueError("filter_eq must be a JSON object with 'field' and 'value' keys")
         normalize = normalize_csv if args.format == "csv" else normalize_jsonl
-        result = normalize(args.source, json.loads(Path(args.schema).read_text(encoding="utf-8")),
+        schema = json.loads(Path(args.schema).read_text(encoding="utf-8"))
+        result = normalize(args.source, schema,
                            duplicate_by=args.duplicate_by, filter_eq=filter_eq)
-        _write_jsonl_outputs_atomic(args.output, result["records"], args.errors, result["errors"])
+        if args.output_format == "csv":
+            output_payload = _csv_payload(schema["columns"], result["records"])
+        else:
+            output_payload = _jsonl_payload(result["records"])
+        _write_outputs_atomic(args.output, output_payload,
+                              args.errors, _jsonl_payload(result["errors"]))
         summary = {"accepted": result["accepted"], "rejected": result["rejected"]}
         if args.filter_eq is not None:
             summary["filtered"] = result["filtered"]
