@@ -1914,6 +1914,274 @@ class MissingValuesTests(unittest.TestCase):
                 self.assertFalse(errors.exists())
 
 
+class IntegerRangeTests(unittest.TestCase):
+    """An integer column may declare inclusive minimum/maximum bounds."""
+
+    def ranged_schema(self, **orders_overrides):
+        column = {"name": "orders", "type": "integer",
+                  "minimum": 0, "maximum": 5, "default": 3,
+                  "missing_values": ["N/A"]}
+        column.update(orders_overrides)
+        return {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            column,
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+
+    def write_source(self, directory, text, fmt):
+        path = Path(directory) / ("data.csv" if fmt == "csv" else "data.jsonl")
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def normalize(self, path, schema, fmt, **kwargs):
+        return (normalize_csv if fmt == "csv" else normalize_jsonl)(path, schema, **kwargs)
+
+    RANGE_ROWS = {
+        "csv": ("name,orders,active\n"
+                "a,0,true\n"
+                "b,3,true\n"
+                "c,5,true\n"
+                "d,-1,true\n"
+                "e,6,true\n"
+                "f,bad,true\n"
+                "g, N/A ,true\n"),
+        "jsonl": ('{"name": "a", "orders": "0", "active": true}\n'
+                  '{"name": "b", "orders": 3, "active": true}\n'
+                  '{"name": "c", "orders": "5", "active": true}\n'
+                  '{"name": "d", "orders": -1, "active": true}\n'
+                  '{"name": "e", "orders": 6, "active": true}\n'
+                  '{"name": "f", "orders": "bad", "active": true}\n'
+                  '{"name": "g", "orders": " N/A ", "active": true}\n'),
+    }
+
+    def test_range_bounds_default_and_marker(self):
+        # 0, 3, 5 and the marker (defaulted to 3) are accepted; -1 and 6
+        # are out of range and "bad" keeps only its integer type error.
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.RANGE_ROWS[fmt], fmt)
+                result = self.normalize(path, self.ranged_schema(), fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (4, 3))
+            self.assertEqual([record["orders"] for record in result["records"]],
+                             [0, 3, 5, 3])
+            self.assertEqual([row["row"] for row in result["errors"]],
+                             [5, 6, 7] if fmt == "csv" else [4, 5, 6])
+            self.assertEqual(result["errors"][0]["errors"],
+                             ["orders: value -1 is less than minimum 0"])
+            self.assertEqual(result["errors"][1]["errors"],
+                             ["orders: value 6 is greater than maximum 5"])
+            type_error = result["errors"][2]["errors"]
+            self.assertEqual(len(type_error), 1)
+            self.assertTrue(type_error[0].startswith("orders:"))
+            self.assertNotIn("minimum", type_error[0])
+            self.assertNotIn("maximum", type_error[0])
+
+    def test_range_feeds_filter_and_duplicates(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.RANGE_ROWS[fmt], fmt)
+                combined = self.normalize(path, self.ranged_schema(), fmt,
+                                          duplicate_by=["orders"],
+                                          filter_eq={"field": "orders", "value": 3})
+            # out-of-range rows are rejected, never filtered
+            self.assertEqual((combined["accepted"], combined["filtered"],
+                              combined["rejected"]), (2, 2, 3))
+            self.assertEqual([record["orders"] for record in combined["records"]], [3, 3])
+            self.assertEqual(combined["duplicates"],
+                             [{"key": {"orders": 3}, "record_numbers": [1, 2]}])
+
+    def test_single_ended_and_equal_bounds(self):
+        cases = (
+            ({"minimum": -2}, [-2, -1, 0, 99], [-3]),
+            ({"maximum": 2}, [-99, 0, 2], [3]),
+            ({"minimum": 4, "maximum": 4}, [4], [3, 5]),
+            ({"minimum": 0, "maximum": 0}, [0], [-1, 1]),
+        )
+        for bounds, accepted_values, rejected_values in cases:
+            with self.subTest(bounds=bounds):
+                schema = {"columns": [{"name": "f", "type": "integer", **bounds}]}
+                lines = [str(value) for value in accepted_values + rejected_values]
+                with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                    csv_path = self.write_source(directory, "f\n" + "\n".join(lines) + "\n", "csv")
+                    result = normalize_csv(csv_path, schema)
+                self.assertEqual([record["f"] for record in result["records"]],
+                                 accepted_values)
+                self.assertEqual(result["rejected"], len(rejected_values))
+
+    def test_null_and_required_empty_ignore_bounds(self):
+        optional = {"columns": [{"name": "f", "type": "integer", "minimum": 2}]}
+        required = {"columns": [{"name": "f", "type": "integer",
+                                 "required": True, "maximum": 2}]}
+        for fmt, empty_cell, low, high in (
+                ("csv", " ", "1", "3"), ("jsonl", "null", "1", "3")):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                optional_path = self.write_source(
+                    directory, (f"f\n{empty_cell}\n{low}\n" if fmt == "csv"
+                                else f'{{"f": {empty_cell}}}\n{{"f": {low}}}\n'), fmt)
+                null_result = self.normalize(optional_path, optional, fmt)
+                required_path = self.write_source(
+                    directory, (f"f\n{empty_cell}\n{high}\n" if fmt == "csv"
+                                else f'{{"f": {empty_cell}}}\n{{"f": {high}}}\n'), fmt)
+                required_result = self.normalize(required_path, required, fmt)
+            # an empty optional stays null and is never range-checked
+            self.assertEqual(null_result["records"], [{"f": None}])
+            self.assertEqual(null_result["errors"][0]["errors"],
+                             [f"f: value {low} is less than minimum 2"])
+            # an empty required keeps its ordinary error
+            self.assertEqual(required_result["errors"][0]["errors"],
+                             ["f: required value is empty"])
+            self.assertEqual(required_result["errors"][1]["errors"],
+                             [f"f: value {high} is greater than maximum 2"])
+
+    def test_enum_and_type_failures_keep_only_their_error(self):
+        schema = {"columns": [
+            {"name": "o", "type": "integer",
+             "allowed_values": [1, 9], "minimum": 0, "maximum": 5},
+            {"name": "r", "type": "integer", "minimum": 0},
+        ]}
+        # 9 passes the enum but violates the range; 8 violates the enum
+        # (its range violation is not reported); "x" keeps the type error.
+        for fmt, text in (
+                ("csv", "o,r\n9,1\n8,1\nx,1\n"),
+                ("jsonl", '{"o": 9, "r": 1}\n{"o": 8, "r": 1}\n{"o": "x", "r": 1}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (0, 3))
+            self.assertEqual(result["errors"][0]["errors"],
+                             ["o: value 9 is greater than maximum 5"])
+            self.assertEqual(result["errors"][1]["errors"],
+                             ["o: value 8 is not one of allowed_values [1, 9]"])
+            self.assertEqual(len(result["errors"][2]["errors"]), 1)
+            self.assertTrue(result["errors"][2]["errors"][0].startswith("o:"))
+
+    def test_enum_entries_out_of_range_are_not_a_config_error(self):
+        # An allowed_values entry outside the range is legal; records
+        # converted to it still fail the range check.
+        schema = {"columns": [{"name": "f", "type": "integer",
+                               "allowed_values": [1, 9], "maximum": 5}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_source(directory, "f\n1\n9\n", "csv")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"f": 1}])
+        self.assertEqual(result["errors"][0]["errors"],
+                         ["f: value 9 is greater than maximum 5"])
+
+    def test_multi_field_errors_in_schema_order(self):
+        schema = {"columns": [
+            {"name": "a", "type": "integer", "minimum": 0},
+            {"name": "b", "type": "integer", "maximum": 0},
+        ]}
+        for fmt, text in (("csv", "a,b\n-1,2\n"),
+                          ("jsonl", '{"a": -1, "b": 2}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual(result["errors"][0]["errors"], [
+                "a: value -1 is less than minimum 0",
+                "b: value 2 is greater than maximum 0",
+            ])
+
+    def test_invalid_range_config_raises_before_reading(self):
+        import copy
+        missing = {"csv": ROOT / "samples" / "does-not-exist.csv",
+                   "jsonl": ROOT / "samples" / "does-not-exist.jsonl"}
+        bad_columns = [
+            # bounds must be non-boolean integers
+            {"name": "f", "type": "integer", "minimum": True},
+            {"name": "f", "type": "integer", "maximum": False},
+            {"name": "f", "type": "integer", "minimum": None},
+            {"name": "f", "type": "integer", "maximum": None},
+            {"name": "f", "type": "integer", "minimum": "0"},
+            {"name": "f", "type": "integer", "maximum": "5"},
+            {"name": "f", "type": "integer", "minimum": 1.0},
+            {"name": "f", "type": "integer", "maximum": 2.5},
+            {"name": "f", "type": "integer", "minimum": [0]},
+            # bounds on non-integer columns
+            {"name": "f", "type": "string", "minimum": 0},
+            {"name": "f", "type": "string", "maximum": 5},
+            {"name": "f", "type": "boolean", "minimum": 0},
+            {"name": "f", "type": "boolean", "maximum": 5},
+            # minimum above maximum
+            {"name": "f", "type": "integer", "minimum": 6, "maximum": 5},
+            # default out of range, even though no record would use it
+            {"name": "f", "type": "integer", "default": -1, "minimum": 0},
+            {"name": "f", "type": "integer", "default": 6, "maximum": 5},
+            {"name": "f", "type": "integer", "default": 4,
+             "minimum": 0, "maximum": 3},
+        ]
+        for fmt in ("csv", "jsonl"):
+            normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+            for column in bad_columns:
+                with self.subTest(fmt=fmt, column=column):
+                    schema = {"columns": [column]}
+                    snapshot = copy.deepcopy(schema)
+                    with self.assertRaises(ValueError) as caught:
+                        normalize(missing[fmt], schema)
+                    message = str(caught.exception)
+                    self.assertIn("f", message)
+                    attribute = "maximum" if "maximum" in column else "minimum"
+                    if "default" in column and not (
+                            "minimum" in column and "maximum" in column
+                            and column["minimum"] > column["maximum"]):
+                        attribute = "default"
+                    self.assertIn(attribute, message)
+                    self.assertEqual(schema, snapshot)
+        # negative and zero bounds are legal; the missing file fails next
+        schema = {"columns": [{"name": "f", "type": "integer",
+                               "minimum": -10, "maximum": 0, "default": -3}]}
+        with self.assertRaises(OSError):
+            normalize_csv(missing["csv"], schema)
+
+    def test_cli_bad_range_exit_two_keeps_files(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = Path(directory) / f"source.{fmt}"
+                source.write_text(
+                    "name,orders,active\nA,3,true\n" if fmt == "csv"
+                    else '{"name": "A", "orders": 3, "active": true}\n',
+                    encoding="utf-8")
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps({"columns": [
+                    {"name": "name", "type": "string", "required": True},
+                    {"name": "orders", "type": "integer", "minimum": 5, "maximum": 0},
+                    {"name": "active", "type": "boolean", "required": True},
+                ]}), encoding="utf-8")
+                output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+                output.write_text("keep me\n", encoding="utf-8")
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("orders", payload["error"])
+                self.assertIn("minimum", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
+
+    def test_cli_range_row_errors_exit_one_and_export(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = self.write_source(directory, self.RANGE_ROWS[fmt], fmt)
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps(self.ranged_schema()), encoding="utf-8")
+                output, errors = Path(directory) / "records.jsonl", Path(directory) / "errors.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(json.loads(run.stdout), {"accepted": 4, "rejected": 3})
+                records = [json.loads(line) for line in output.read_text().splitlines()]
+                self.assertEqual([record["orders"] for record in records], [0, 3, 5, 3])
+                error_rows = [json.loads(line) for line in errors.read_text().splitlines()]
+                self.assertEqual(len(error_rows), 3)
+                self.assertEqual(hidden_entries(directory), [])
+
+
 class SchemaStructureTests(unittest.TestCase):
     """Malformed schema shapes raise a clear ValueError before the data
     file is opened, identically for normalize_csv and normalize_jsonl."""

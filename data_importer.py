@@ -102,6 +102,75 @@ def _prepare_allowed_values(columns, defaults):
     return allowed
 
 
+def _prepare_ranges(columns, defaults):
+    """Validate the optional ``minimum``/``maximum`` bounds of each column.
+
+    Returns a mapping of output field name to a ``(minimum, maximum)``
+    pair, with None for an unset end; either end may be declared alone
+    and equal ends accept exactly that one integer. Bounds may appear
+    only on ``integer`` columns and each must be a non-boolean integer
+    (negative values and zero are legal): null, strings, floats and
+    booleans are configuration errors, as is a minimum greater than the
+    maximum. A processed default outside the declared range is a
+    configuration error even when no row needs it. Raises ValueError
+    naming the output field, the attribute and the offending value
+    before the input is read; the caller's schema is never mutated.
+    """
+    ranges = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        bounds = {}
+        for attribute in ("minimum", "maximum"):
+            if attribute not in column:
+                continue
+            bound = column[attribute]
+            if kind != "integer":
+                raise ValueError(
+                    f"column {name!r} {attribute} {bound!r} requires an integer column")
+            if isinstance(bound, bool) or not isinstance(bound, int):
+                raise ValueError(
+                    f"column {name!r} {attribute} {bound!r} must be a non-boolean integer")
+            bounds[attribute] = bound
+        if not bounds:
+            continue
+        minimum = bounds.get("minimum")
+        maximum = bounds.get("maximum")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(
+                f"column {name!r} minimum {minimum!r} is greater than "
+                f"maximum {maximum!r}")
+        if name in defaults:
+            default = defaults[name]
+            if minimum is not None and default < minimum:
+                raise ValueError(
+                    f"column {name!r} default {default!r} is less than "
+                    f"minimum {minimum!r}")
+            if maximum is not None and default > maximum:
+                raise ValueError(
+                    f"column {name!r} default {default!r} is greater than "
+                    f"maximum {maximum!r}")
+        ranges[name] = (minimum, maximum)
+    return ranges
+
+
+def _range_field_error(name, value, ranges):
+    """Return the range error for a converted value, or None when in range.
+
+    Null is never checked: an empty optional without a default stays null
+    and the inclusive bounds only see non-null integers, after type
+    conversion, empty handling and the enum check.
+    """
+    bounds = ranges.get(name)
+    if bounds is None or value is None:
+        return None
+    minimum, maximum = bounds
+    if minimum is not None and value < minimum:
+        return f"{name}: value {value!r} is less than minimum {minimum!r}"
+    if maximum is not None and value > maximum:
+        return f"{name}: value {value!r} is greater than maximum {maximum!r}"
+    return None
+
+
 def _prepare_missing_values(columns):
     """Validate the optional ``missing_values`` marker list of each column.
 
@@ -193,6 +262,7 @@ def _prepare_schema(schema):
     defaults = _prepare_defaults(columns)
     allowed = _prepare_allowed_values(columns, defaults)
     markers = _prepare_missing_values(columns)
+    ranges = _prepare_ranges(columns, defaults)
     sources = []
     for column in columns:
         name = column["name"]
@@ -209,7 +279,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers
+    return columns, sources, defaults, allowed, markers, ranges
 
 
 def _prepare_duplicate_by(duplicate_by, names):
@@ -343,7 +413,7 @@ def _csv_error_reason(exc):
 
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults, allowed, markers = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, ranges = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -415,6 +485,10 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                         enum_error = _enum_field_error(name, converted, allowed)
                         if enum_error is not None:
                             row_errors.append(enum_error)
+                            continue
+                        range_error = _range_field_error(name, converted, ranges)
+                        if range_error is not None:
+                            row_errors.append(range_error)
                         else:
                             record[name] = converted
                 if row_errors:
@@ -470,7 +544,7 @@ def _convert_jsonl_value(column, value, defaults, markers):
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults, allowed, markers = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, ranges = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -528,6 +602,10 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
                 enum_error = _enum_field_error(column["name"], converted, allowed)
                 if enum_error is not None:
                     row_errors.append(enum_error)
+                    continue
+                range_error = _range_field_error(column["name"], converted, ranges)
+                if range_error is not None:
+                    row_errors.append(range_error)
                 else:
                     record[column["name"]] = converted
             if row_errors:
