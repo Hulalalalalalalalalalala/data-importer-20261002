@@ -4044,5 +4044,260 @@ class CsvOutputTests(unittest.TestCase):
                 output.chmod(0o644)
 
 
+class UnicodeNormalizationTests(unittest.TestCase):
+    """Per-field NFKC normalization for ``string`` columns."""
+
+    E_ACUTE_COMPOSED = "é"
+    E_ACUTE_DECOMPOSED = "e" + "́"
+    FULLWIDTH_A = "Ａ"
+
+    def schema(self, **overrides):
+        column = {"name": "code", "type": "string", "default": self.FULLWIDTH_A,
+                  "allowed_values": ["A", self.E_ACUTE_COMPOSED],
+                  "unicode_normalization": "NFKC"}
+        column.update(overrides)
+        return {"columns": [column]}
+
+    def write_csv(self, directory, text):
+        path = Path(directory) / "data.csv"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_jsonl(self, directory, values, key="code"):
+        path = Path(directory) / "data.jsonl"
+        path.write_text("".join(json.dumps({key: value}, ensure_ascii=False) + "\n"
+                                for value in values), encoding="utf-8")
+        return path
+
+    def expected_records(self):
+        return [{"code": "A"}, {"code": "A"},
+                {"code": self.E_ACUTE_COMPOSED}, {"code": "A"}]
+
+    def test_fixed_sample_csv_and_jsonl(self):
+        # Full-width A, plain A, decomposed e + combining acute, the empty
+        # value (filled with the full-width-A default), and illegal x.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "code\n" + self.FULLWIDTH_A + "\nA\n"
+                + self.E_ACUTE_DECOMPOSED + '\n""\nx\n')
+            jsonl_path = self.write_jsonl(
+                directory,
+                [self.FULLWIDTH_A, "A", self.E_ACUTE_DECOMPOSED, None, "x"])
+            for normalize, path in ((normalize_csv, csv_path),
+                                   (normalize_jsonl, jsonl_path)):
+                result = normalize(path, self.schema(), duplicate_by=["code"])
+                self.assertEqual(result["records"], self.expected_records())
+                self.assertEqual((result["accepted"], result["rejected"]), (4, 1))
+                self.assertEqual(result["duplicates"], [
+                    {"key": {"code": "A"}, "record_numbers": [1, 2, 4]},
+                ])
+                self.assertEqual(result["errors"][0]["row"],
+                                 6 if normalize is normalize_csv else 5)
+                self.assertIn("allowed_values", result["errors"][0]["errors"][0])
+
+    def test_filter_then_dedup_use_final_values(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "code\n" + self.FULLWIDTH_A + "\nA\n"
+                + self.E_ACUTE_DECOMPOSED + '\n""\nx\n')
+            jsonl_path = self.write_jsonl(
+                directory,
+                [self.FULLWIDTH_A, "A", self.E_ACUTE_DECOMPOSED, None, "x"])
+            for normalize, path in ((normalize_csv, csv_path),
+                                   (normalize_jsonl, jsonl_path)):
+                filtered = normalize(
+                    path, self.schema(),
+                    filter_eq={"field": "code", "value": "A"})
+                self.assertEqual([r["code"] for r in filtered["records"]],
+                                 ["A", "A", "A"])
+                self.assertEqual((filtered["accepted"], filtered["filtered"],
+                                  filtered["rejected"]), (3, 1, 1))
+                deduped = normalize(
+                    path, self.schema(),
+                    filter_eq={"field": "code", "value": "A"},
+                    deduplicate_by=["code"])
+                self.assertEqual(deduped["records"], [{"code": "A"}])
+                self.assertEqual(deduped["deduplicated"], 2)
+                # filter_eq strings stay verbatim: the pre-normalization
+                # spelling matches nothing.
+                folded = normalize(
+                    path, self.schema(),
+                    filter_eq={"field": "code", "value": self.FULLWIDTH_A})
+                self.assertEqual(folded["accepted"], 0)
+                self.assertEqual(folded["filtered"], 4)
+
+    def test_whitespace_is_trimmed_around_normalization(self):
+        schema = {"columns": [{"name": "f", "type": "string",
+                               "unicode_normalization": "NFKC"}]}
+        # surrounding ASCII whitespace is trimmed first; an interior
+        # full-width space survives the first strip and becomes an ASCII
+        # space under NFKC; the decomposed sequence folds to composed é.
+        text = ("f\n  " + self.FULLWIDTH_A + "  \n"
+                + self.FULLWIDTH_A + "　" + self.FULLWIDTH_A + "\n"
+                + self.E_ACUTE_DECOMPOSED + "\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual([r["f"] for r in result["records"]],
+                         ["A", "A A", self.E_ACUTE_COMPOSED])
+
+    def test_markers_match_before_normalization_but_not_again_after(self):
+        # Marker "A" matches the plain input, but the full-width input only
+        # becomes "A" through NFKC and must not be marker-matched again.
+        schema = {"columns": [{"name": "f", "type": "string",
+                               "missing_values": ["A"],
+                               "unicode_normalization": "NFKC"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "f\nA\n" + self.FULLWIDTH_A + "\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"f": None}, {"f": "A"}])
+
+    def test_normalized_default_is_the_filled_value(self):
+        schema = self.schema()
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'code\n""\n')
+            jsonl_path = self.write_jsonl(directory, [None])
+            for normalize, path in ((normalize_csv, csv_path),
+                                   (normalize_jsonl, jsonl_path)):
+                self.assertEqual(normalize(path, schema)["records"],
+                                 [{"code": "A"}])
+
+    def test_jsonl_non_string_keeps_type_error(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "data.jsonl"
+            path.write_text('{"code": 4}\n{"code": ["x"]}\n', encoding="utf-8")
+            result = normalize_jsonl(path, self.schema())
+        self.assertEqual(result["rejected"], 2)
+        self.assertTrue(all(row["errors"] == ["code: expected string"]
+                            for row in result["errors"]))
+
+    def test_undeclared_attribute_keeps_old_behavior(self):
+        schema = {"columns": [{"name": "f", "type": "string",
+                               "allowed_values": [self.FULLWIDTH_A,
+                                                  self.E_ACUTE_DECOMPOSED]}]}
+        text = "f\n" + self.FULLWIDTH_A + "\n" + self.E_ACUTE_DECOMPOSED + "\n"
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual([r["f"] for r in result["records"]],
+                         [self.FULLWIDTH_A, self.E_ACUTE_DECOMPOSED])
+
+    def test_field_source_header_and_key_names_are_not_normalized(self):
+        schema = {"columns": [{"name": "code", "type": "string", "source": self.FULLWIDTH_A,
+                               "unicode_normalization": "NFKC"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, self.FULLWIDTH_A + "\n" + self.FULLWIDTH_A + "\n")
+            self.assertEqual(normalize_csv(csv_path, schema)["records"], [{"code": "A"}])
+            jsonl_path = self.write_jsonl(
+                directory, [self.FULLWIDTH_A], key=self.FULLWIDTH_A)
+            self.assertEqual(normalize_jsonl(jsonl_path, schema)["records"],
+                             [{"code": "A"}])
+
+    def test_invalid_attribute_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        bad_values = ["nfkc", "NFKc", "NFC", "NFKD", "", " NFKC ", 3, True, None,
+                      ["NFKC"]]
+        for value in bad_values:
+            schema = {"columns": [{"name": "f", "type": "string",
+                                   "unicode_normalization": value}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("unicode_normalization", message, value)
+            self.assertIn("f", message, value)
+            self.assertIn(repr(value), message, value)
+            with self.assertRaises(ValueError):
+                normalize_jsonl(missing, schema)
+        for kind in ("integer", "boolean"):
+            schema = {"columns": [{"name": "f", "type": kind,
+                                   "unicode_normalization": "NFKC"}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("unicode_normalization", message)
+            self.assertIn("f", message)
+
+    def test_normalized_default_blank_or_outside_enum_is_config_error(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        # whitespace-only defaults (including a full-width space) are still
+        # blank after trimming and are refused with the default wording
+        for default in ("　", "  　  "):
+            schema = {"columns": [{"name": "f", "type": "string",
+                                   "default": default,
+                                   "unicode_normalization": "NFKC"}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            self.assertIn("default", str(caught.exception))
+        # the processed full-width A is not in the verbatim enum
+        schema = self.schema(allowed_values=[self.E_ACUTE_COMPOSED])
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertIn("allowed_values", str(caught.exception))
+
+    def test_schema_dict_is_never_mutated(self):
+        import copy
+        schema = self.schema()
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory, "code\n" + self.FULLWIDTH_A + '\n""\n')
+            normalize_csv(csv_path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_cli_bad_attribute_exit_two_keeps_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_csv(directory, "code\nx\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(
+                {"columns": [{"name": "code", "type": "string",
+                              "unicode_normalization": "nfkc"}]}),
+                encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("unicode_normalization", payload["error"])
+            self.assertIn("nfkc", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+    def test_cli_normalizes_and_exports_both_input_formats(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(
+                json.dumps(self.schema(), ensure_ascii=False), encoding="utf-8")
+            jsonl_path = self.write_jsonl(
+                directory, [self.FULLWIDTH_A, "A", self.E_ACUTE_DECOMPOSED,
+                            None, "x"])
+            csv_path = self.write_csv(
+                directory,
+                "code\n" + self.FULLWIDTH_A + "\nA\n"
+                + self.E_ACUTE_DECOMPOSED + '\n""\nx\n')
+            for fmt, source in (("csv", csv_path), ("jsonl", jsonl_path)):
+                output = Path(directory) / f"out-{fmt}.jsonl"
+                errors = Path(directory) / f"err-{fmt}.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"),
+                           str(source), "--schema", str(schema_path),
+                           "--output", str(output), "--errors", str(errors),
+                           "--format", fmt, "--duplicate-by", "code"]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                summary = json.loads(run.stdout)
+                self.assertEqual(summary["accepted"], 4)
+                self.assertEqual(summary["rejected"], 1)
+                self.assertEqual(summary["duplicates"], [
+                    {"key": {"code": "A"}, "record_numbers": [1, 2, 4]}])
+                records = [json.loads(line)
+                           for line in output.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(records, self.expected_records())
+
+
 if __name__ == "__main__":
     unittest.main()

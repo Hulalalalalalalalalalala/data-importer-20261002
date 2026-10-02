@@ -5,16 +5,49 @@ import csv
 import json
 import os
 import tempfile
+import unicodedata
 from pathlib import Path
 
 
-def _prepare_defaults(columns):
+def _prepare_unicode_normalization(columns):
+    """Validate the optional per-column ``unicode_normalization`` attribute.
+
+    Returns the set of output field names that opt in. The attribute may
+    appear only on ``string`` columns and its value must be the exact,
+    case-sensitive string ``"NFKC"``: any other value (other casing or
+    spelling, a non-string) or a declaration on an ``integer`` or
+    ``boolean`` column is a configuration error. Raises ValueError naming
+    ``unicode_normalization``, the output field and the offending value
+    before the input is read; the caller's schema is never mutated.
+    """
+    normalizing = set()
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "unicode_normalization" not in column:
+            continue
+        mode = column["unicode_normalization"]
+        if mode != "NFKC" or not isinstance(mode, str):
+            raise ValueError(
+                f"column {name!r} unicode_normalization {mode!r} must be the "
+                "exact string 'NFKC'")
+        if kind != "string":
+            raise ValueError(
+                f"column {name!r} unicode_normalization {mode!r} requires a string column")
+        normalizing.add(name)
+    return normalizing
+
+
+def _prepare_defaults(columns, normalizing=frozenset()):
     """Validate the optional target-typed ``default`` of each column.
 
     Returns a mapping of output field name to the processed default
-    (string defaults are trimmed). A malformed default is a configuration
-    error naming the default value and output field, raised before the
-    input is read; the caller's schema dicts are never mutated.
+    (string defaults are trimmed; a string column opting into NFKC also
+    has its default NFKC-normalized and re-trimmed). A malformed default
+    is a configuration error naming the default value and output field,
+    raised before the input is read; the caller's schema dicts are never
+    mutated. A normalized string default that becomes blank is refused
+    here so the later ``allowed_values`` membership check keeps using
+    the final emitted text.
     """
     defaults = {}
     for column in columns:
@@ -28,6 +61,11 @@ def _prepare_defaults(columns):
             processed = default.strip()
             if not processed:
                 raise ValueError(f"column {name!r} default {default!r} must not be blank")
+            if name in normalizing:
+                processed = unicodedata.normalize("NFKC", processed).strip()
+                if not processed:
+                    raise ValueError(
+                        f"column {name!r} default {default!r} must not normalize to blank")
             defaults[name] = processed
         elif kind == "integer":
             if isinstance(default, bool) or not isinstance(default, int):
@@ -381,7 +419,8 @@ def _validate_schema_structure(schema):
 def _prepare_schema(schema):
     _validate_schema_structure(schema)
     columns = schema["columns"]
-    defaults = _prepare_defaults(columns)
+    normalizing = _prepare_unicode_normalization(columns)
+    defaults = _prepare_defaults(columns, normalizing)
     allowed = _prepare_allowed_values(columns, defaults)
     markers = _prepare_missing_values(columns)
     aliases = _prepare_boolean_aliases(columns)
@@ -403,7 +442,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing
 
 
 def _prepare_field_list(fields, names, option):
@@ -601,9 +640,20 @@ def _csv_error_reason(exc):
     return message
 
 
+def _nfkc(value):
+    """NFKC-normalize an already trimmed string and trim it again.
+
+    Compatibility composition folds full-width letters onto ASCII and
+    merges combining-mark sequences (``e`` + U+0301 -> ``é``); NFKC may
+    leave fresh leading/trailing whitespace (full-width space U+3000
+    becomes an ASCII space), so the result is trimmed once more.
+    """
+    return unicodedata.normalize("NFKC", value).strip()
+
+
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -680,6 +730,21 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                                     raise ValueError("boolean must be true or false")
                             else:
                                 converted = value
+                                if name in normalizing:
+                                    converted = _nfkc(converted)
+                                    if not converted:
+                                        # A non-empty trimmed value whose
+                                        # NFKC normalization collapses to
+                                        # blank follows the ordinary
+                                        # empty-value flow; markers are not
+                                        # matched a second time and a filled
+                                        # default was normalized at load.
+                                        if name in defaults:
+                                            converted = defaults[name]
+                                        elif column.get("required", False):
+                                            raise ValueError("required value is empty")
+                                        else:
+                                            converted = None
                         except ValueError as exc:
                             slots[index].append(f"{name}: {exc}")
                             field_error_names.add(name)
@@ -712,7 +777,8 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                          deduplicate_fields)
 
 
-def _convert_jsonl_value(column, value, defaults, markers, aliases):
+def _convert_jsonl_value(column, value, defaults, markers, aliases,
+                         normalizing=frozenset()):
     """Convert one decoded JSON value. Returns (converted, error_message)."""
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
@@ -731,6 +797,18 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases):
     if kind == "string":
         if not isinstance(value, str):
             return None, f"{name}: expected string"
+        if name in normalizing:
+            normalized = _nfkc(value)
+            if not normalized:
+                # NFKC collapsed a non-empty string to blank: the ordinary
+                # empty-value flow applies, without matching markers again;
+                # a filled default was normalized at load.
+                if name in defaults:
+                    return defaults[name], None
+                if column.get("required", False):
+                    return None, f"{name}: required value is empty"
+                return None, None
+            value = normalized
         return value, None
     if kind == "integer":
         if isinstance(value, bool):
@@ -757,7 +835,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases):
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -815,7 +893,8 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
             field_error_names = set()
             for index, (column, origin) in enumerate(zip(columns, sources)):
                 name = column["name"]
-                converted, message = _convert_jsonl_value(column, obj[origin], defaults, markers, aliases)
+                converted, message = _convert_jsonl_value(
+                    column, obj[origin], defaults, markers, aliases, normalizing)
                 if message is not None:
                     slots[index].append(message)
                     field_error_names.add(name)
