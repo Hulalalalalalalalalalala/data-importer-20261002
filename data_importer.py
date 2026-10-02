@@ -8,6 +8,39 @@ import tempfile
 from pathlib import Path
 
 
+def _prepare_defaults(columns):
+    """Validate the optional target-typed ``default`` of each column.
+
+    Returns a mapping of output field name to the processed default
+    (string defaults are trimmed). A malformed default is a configuration
+    error naming the default value and output field, raised before the
+    input is read; the caller's schema dicts are never mutated.
+    """
+    defaults = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "default" not in column:
+            continue
+        default = column["default"]
+        if kind == "string":
+            if not isinstance(default, str):
+                raise ValueError(f"column {name!r} default {default!r} must be a string")
+            processed = default.strip()
+            if not processed:
+                raise ValueError(f"column {name!r} default {default!r} must not be blank")
+            defaults[name] = processed
+        elif kind == "integer":
+            if isinstance(default, bool) or not isinstance(default, int):
+                raise ValueError(
+                    f"column {name!r} default {default!r} must be a non-boolean integer")
+            defaults[name] = default
+        else:
+            if not isinstance(default, bool):
+                raise ValueError(f"column {name!r} default {default!r} must be a boolean")
+            defaults[name] = default
+    return defaults
+
+
 def _prepare_schema(schema):
     columns = schema["columns"]
     names = [column["name"] for column in columns]
@@ -15,6 +48,7 @@ def _prepare_schema(schema):
         raise ValueError("schema column names must be nonempty and unique")
     if any(column["type"] not in ("string", "integer", "boolean") for column in columns):
         raise ValueError("unsupported column type")
+    defaults = _prepare_defaults(columns)
     sources = []
     for column in columns:
         name = column["name"]
@@ -31,7 +65,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources
+    return columns, sources, defaults
 
 
 def _prepare_duplicate_by(duplicate_by, names):
@@ -133,7 +167,7 @@ def _build_result(records, errors, duplicate_fields, filter_condition):
 
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources = _prepare_schema(schema)
+    columns, sources, defaults = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -168,9 +202,12 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                     value = value.strip()
                     try:
                         if not value:
-                            if column.get("required", False):
+                            if name in defaults:
+                                record[name] = defaults[name]
+                            elif column.get("required", False):
                                 raise ValueError("required value is empty")
-                            record[name] = None
+                            else:
+                                record[name] = None
                         elif kind == "integer":
                             record[name] = int(value)
                         elif kind == "boolean":
@@ -188,12 +225,14 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
     return _build_result(records, errors, duplicate_fields, filter_condition)
 
 
-def _convert_jsonl_value(column, value):
+def _convert_jsonl_value(column, value, defaults):
     """Convert one decoded JSON value. Returns (converted, error_message)."""
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
         value = value.strip()
     if value is None or value == "":
+        if name in defaults:
+            return defaults[name], None
         if column.get("required", False):
             return None, f"{name}: required value is empty"
         return None, None
@@ -222,7 +261,7 @@ def _convert_jsonl_value(column, value):
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources = _prepare_schema(schema)
+    columns, sources, defaults = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -273,7 +312,7 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
                 continue
             record = {}
             for column, origin in zip(columns, sources):
-                converted, message = _convert_jsonl_value(column, obj[origin])
+                converted, message = _convert_jsonl_value(column, obj[origin], defaults)
                 if message is not None:
                     row_errors.append(message)
                 else:

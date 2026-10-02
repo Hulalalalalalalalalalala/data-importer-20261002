@@ -482,6 +482,163 @@ class ImporterTests(unittest.TestCase):
             self.assertEqual(outputs[0], outputs[1])
 
 
+    def test_default_fills_empty_for_optional_and_required_csv(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True, "default": "  Nobody "},
+            {"name": "orders", "type": "integer", "default": 0},
+            {"name": "active", "type": "boolean", "required": True, "default": False},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                " , ,  \n"
+                "Maya,3,true\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (2, 0))
+        self.assertEqual(result["records"][0], {"name": "Nobody", "orders": 0, "active": False})
+        self.assertEqual(result["records"][1], {"name": "Maya", "orders": 3, "active": True})
+
+    def test_default_nonempty_invalid_value_is_not_masked_csv(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "default": "Nobody"},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "default": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,bad,true\n"
+                ",,\n"
+                "b,3,true\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (2, 1))
+        self.assertEqual(result["errors"][0]["row"], 2)
+        self.assertTrue(any("orders" in message for message in result["errors"][0]["errors"]))
+        self.assertEqual([record["name"] for record in result["records"]], ["Nobody", "b"])
+
+    def test_default_does_not_relax_cell_count_csv(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "default": "Nobody"},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "default": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\nMaya,3\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["rejected"], 1)
+        self.assertEqual(result["errors"][0]["errors"], ["wrong number of cells"])
+
+    def test_default_feeds_filter_and_duplicates_csv(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,3,true\n"
+                "b,,true\n"
+                "bad,x,true\n"
+                "c,3,true\n")
+            filtered = normalize_csv(csv_path, schema,
+                                     filter_eq={"field": "orders", "value": 3})
+            duplicates = normalize_csv(csv_path, schema, duplicate_by=["orders"])
+        self.assertEqual([r["name"] for r in filtered["records"]], ["a", "b", "c"])
+        self.assertEqual((filtered["accepted"], filtered["filtered"], filtered["rejected"]), (3, 0, 1))
+        self.assertEqual(duplicates["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2, 3]}])
+
+    def test_invalid_default_raises_before_reading_csv(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        bad_defaults = [
+            ("string", 3), ("string", True), ("string", None), ("string", ""),
+            ("string", "   "), ("string", ["x"]), ("string", {"x": 1}),
+            ("integer", "3"), ("integer", 3.0), ("integer", True), ("integer", None),
+            ("integer", [3]),
+            ("boolean", "true"), ("boolean", 1), ("boolean", 0), ("boolean", None),
+            ("boolean", {"x": 1}),
+        ]
+        for kind, default in bad_defaults:
+            schema = {"columns": [{"name": "f", "type": kind, "default": default}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("f", message, (kind, default))
+            self.assertIn("default", message, (kind, default))
+            self.assertIn(repr(default), message, (kind, default))
+        # valid zero/false defaults are accepted
+        for kind, default in (("integer", 0), ("boolean", False)):
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                csv_path = self.write_csv(directory, "f\n \n")
+                result = normalize_csv(
+                    csv_path, {"columns": [{"name": "f", "type": kind, "default": default}]})
+                self.assertEqual(result["records"], [{"f": default}])
+
+    def test_schema_dict_unchanged_with_defaults_csv(self):
+        import copy
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True, "default": "  Maya "},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\n,,true\n")
+            normalize_csv(csv_path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_cli_bad_default_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\nA,3,TRUE\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps({"columns": [
+                {"name": "name", "type": "string", "required": True},
+                {"name": "orders", "type": "integer", "default": "3"},
+                {"name": "active", "type": "boolean", "required": True},
+            ]}), encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(csv_path),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors)]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertTrue(payload["error"].strip())
+            self.assertIn("orders", payload["error"])
+            self.assertIn("default", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+    def test_cli_defaults_applied_and_exported(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory, "name,orders,active\n,,true\nMaya,,false\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps({"columns": [
+                {"name": "name", "type": "string", "required": True, "default": "Nobody"},
+                {"name": "orders", "type": "integer", "default": 3},
+                {"name": "active", "type": "boolean", "required": True},
+            ]}), encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(csv_path),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors)]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {"accepted": 2, "rejected": 0})
+            records = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(records, [
+                {"active": True, "name": "Nobody", "orders": 3},
+                {"active": False, "name": "Maya", "orders": 3},
+            ])
+
+
 class JsonlImporterTests(unittest.TestCase):
     def setUp(self):
         self.schema = json.loads((ROOT / "samples/schema.json").read_text())
@@ -866,6 +1023,134 @@ class JsonlImporterTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 normalize_jsonl(missing, self.schema, filter_eq=condition)
             self.assertIn("filter_eq", str(caught.exception))
+
+    def test_default_fills_null_and_empty_string_jsonl(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True, "default": "Nobody"},
+            {"name": "orders", "type": "integer", "default": 0},
+            {"name": "active", "type": "boolean", "required": True, "default": False},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": null, "orders": "", "active": "  "}\n'
+                '{"name": "  ", "orders": null, "active": null}\n'
+                '{"name": "Maya", "orders": "3", "active": "TRUE"}\n')
+            result = normalize_jsonl(path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (3, 0))
+        self.assertEqual(result["records"][0], {"name": "Nobody", "orders": 0, "active": False})
+        self.assertEqual(result["records"][1], {"name": "Nobody", "orders": 0, "active": False})
+        self.assertEqual(result["records"][2], {"name": "Maya", "orders": 3, "active": True})
+
+    def test_default_nonempty_invalid_value_is_not_masked_jsonl(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "default": "Nobody"},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "default": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": "bad", "active": true}\n'
+                '{"name": null, "orders": null, "active": null}\n'
+                '{"name": "b", "orders": 4, "active": false}\n')
+            result = normalize_jsonl(path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (2, 1))
+        self.assertEqual(result["errors"][0]["row"], 1)
+        self.assertTrue(any("orders" in message for message in result["errors"][0]["errors"]))
+        self.assertEqual([record["name"] for record in result["records"]], ["Nobody", "b"])
+
+    def test_default_does_not_relax_key_set_or_duplicate_keys_jsonl(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True, "default": "Nobody"},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "required": True, "default": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "A", "name": "B", "orders": 1, "active": true}\n'
+                '{"name": "A", "active": true}\n'
+                '{"name": "A", "orders": 1, "active": true, "extra": 9}\n')
+            result = normalize_jsonl(path, schema)
+        self.assertEqual(result["rejected"], 3)
+        self.assertTrue(result["errors"][0]["errors"][0].startswith("structure error: duplicate key"))
+        self.assertIn("orders", result["errors"][1]["errors"][0])
+        self.assertIn("extra", result["errors"][2]["errors"][0])
+
+    def test_default_feeds_filter_and_duplicates_jsonl(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": "3", "active": true}\n'
+                '{"name": "b", "orders": null, "active": true}\n'
+                '{"name": "bad", "orders": "x", "active": true}\n'
+                '{"name": "c", "orders": 3, "active": true}\n')
+            filtered = normalize_jsonl(path, schema,
+                                      filter_eq={"field": "orders", "value": 3})
+            duplicates = normalize_jsonl(path, schema, duplicate_by=["orders"])
+        self.assertEqual([r["name"] for r in filtered["records"]], ["a", "b", "c"])
+        self.assertEqual((filtered["accepted"], filtered["filtered"], filtered["rejected"]), (3, 0, 1))
+        self.assertEqual(duplicates["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2, 3]}])
+
+    def test_invalid_default_raises_before_reading_jsonl(self):
+        import copy
+        missing = ROOT / "samples" / "does-not-exist.jsonl"
+        bad_defaults = [
+            ("string", None), ("string", 3), ("string", ""), ("string", "  "),
+            ("integer", None), ("integer", "3"), ("integer", False),
+            ("boolean", None), ("boolean", 0), ("boolean", "true"),
+        ]
+        for kind, default in bad_defaults:
+            schema = {"columns": [{"name": "f", "type": kind, "default": default}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_jsonl(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("f", message)
+            self.assertIn("default", message)
+            self.assertIn(repr(default), message)
+        # caller's schema is not mutated by validation or normalization
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True, "default": " Maya "},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "default": True},
+        ]}
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(directory, '{"name": null, "orders": null, "active": null}\n')
+            normalize_jsonl(path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_cli_jsonl_bad_default_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(directory, '{"name": "A", "orders": 1, "active": true}\n',
+                                    name="source.jsonl")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps({"columns": [
+                {"name": "name", "type": "string", "required": True},
+                {"name": "orders", "type": "integer", "default": True},
+                {"name": "active", "type": "boolean", "required": True},
+            ]}), encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(path),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "jsonl"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertTrue(payload["error"].strip())
+            self.assertIn("orders", payload["error"])
+            self.assertIn("default", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
 
     def test_cli_jsonl_filter_eq_flag_and_exit_codes(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
