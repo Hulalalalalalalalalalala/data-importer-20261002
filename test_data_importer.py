@@ -112,6 +112,150 @@ class ImporterTests(unittest.TestCase):
         self.assertEqual(result["errors"][0]["row"], 3)
         self.assertEqual(result["errors"][0]["errors"], ["wrong number of cells"])
 
+    def assert_csv_quote_fatal(self, csv_path, start_line, reason):
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(csv_path, self.schema)
+        message = str(caught.exception)
+        self.assertIn("CSV parse error", message)
+        self.assertIn(str(csv_path), message)
+        self.assertIn(f"physical line {start_line}", message)
+        self.assertIn(reason, message)
+        # a fatal parse failure never returns partial records
+        self.assertNotIn("records", str(caught.exception))
+
+    def test_csv_unterminated_quote_at_eof_is_fatal(self):
+        # The final record runs into EOF with an open quote; the fault is
+        # reported at that record's own start, even with valid records and
+        # ordinary row errors earlier in the file.
+        cases = [
+            ('name,orders,active\nMaya,3,"true', 2),
+            ('name,orders,active\nMaya,3,true\n\n"a\nb",1,"tr', 4),
+            ('name,orders,active\nMaya,3,true\nBad,x,true\n"oops', 4),
+        ]
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for text, line in cases:
+                csv_path = self.write_csv(directory, text)
+                with self.subTest(text=text):
+                    self.assert_csv_quote_fatal(csv_path, line, "unterminated")
+
+    def test_csv_stray_character_after_closing_quote_is_fatal(self):
+        # Text after a closing quote (including spaces and tabs) is fatal;
+        # a quoted field may only be followed by a comma, a line ending or EOF.
+        cases = [
+            ('name,orders,active\n"Ma"ya,3,true\n', 2),
+            ('name,orders,active\n"Ma" ya,3,true\n', 2),
+            ('name,orders,active\n"Ma"\tya,3,true\n', 2),
+            ('name,orders,active\nMaya,3,true\n"a\nb"x,1,true\n', 3),
+        ]
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for text, line in cases:
+                csv_path = self.write_csv(directory, text)
+                with self.subTest(text=text):
+                    self.assert_csv_quote_fatal(csv_path, line, "unexpected character after closing quote")
+
+    def test_csv_quote_error_reasons_are_distinct(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            unterminated = Path(directory) / "open.csv"
+            unterminated.write_text('name,orders,active\nMaya,3,"true', encoding="utf-8")
+            stray = Path(directory) / "stray.csv"
+            stray.write_text('name,orders,active\n"Ma"ya,3,true\n', encoding="utf-8")
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(unterminated, self.schema)
+            first = str(caught.exception)
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(stray, self.schema)
+            second = str(caught.exception)
+        self.assertIn("unterminated", first)
+        self.assertNotIn("unexpected character", first)
+        self.assertIn("unexpected character after closing quote", second)
+        self.assertNotIn("unterminated", second)
+
+    def test_csv_quote_error_in_header_points_to_line_one(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            stray_header = self.write_csv(directory, '"na"me,orders,active\nx,1,true\n')
+            self.assert_csv_quote_fatal(stray_header, 1, "unexpected character after closing quote")
+            open_header = self.write_csv(directory, '"name,orders,active')
+            self.assert_csv_quote_fatal(open_header, 1, "unterminated")
+
+    def test_csv_quote_errors_with_all_line_endings_bom_and_no_final_newline(self):
+        # Each variant starts its offending record on physical line 4
+        # (header 1, blank 2, good record 3); quoted newlines count too.
+        variants = [
+            (b'name,orders,active\n\nMaya,3,true\n"a\nb",1,"tr', "unterminated"),
+            (b'name,orders,active\r\n\r\nMaya,3,true\r\n"a\r\nb",1,"tr', "unterminated"),
+            (b'name,orders,active\r\rMaya,3,true\r"a\rb",1,"tr', "unterminated"),
+            (b'\xef\xbb\xbfname,orders,active\n\nMaya,3,true\n"Ma"ya,1,true\n',
+             "unexpected character after closing quote"),
+        ]
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for data, reason in variants:
+                csv_path = self.write_csv_bytes(directory, data)
+                with self.subTest(data=data):
+                    self.assert_csv_quote_fatal(csv_path, 4, reason)
+
+    def test_csv_valid_quoted_fields_keep_parsing(self):
+        # Quoted commas, quoted newlines, doubled quotes (one literal quote)
+        # and quotes inside unquoted fields all keep their old behavior,
+        # including no newline at EOF.
+        text = ('name,orders,active\n'
+                '"Ma, ya",3,true\n'
+                '"li\nne",4,false\n'
+                '"x""y",5,true\n'
+                'plain"quote,6,true\n'
+                '"z",7,false')
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (5, 0))
+        self.assertEqual([record["name"] for record in result["records"]],
+                         ["Ma, ya", "li\nne", 'x"y', 'plain"quote', "z"])
+
+    def test_cli_csv_quote_errors_exit_two_and_keep_prior_state(self):
+        # Both faults occur on line 4, after one good record and one
+        # ordinary row error; the run must still abort as a parse failure.
+        inputs = {
+            "unterminated": b'name,orders,active\nMaya,3,true\nBad,x,true\n"a\nb",1,"tr',
+            "stray": b'name,orders,active\nMaya,3,true\nBad,x,true\n"Ma"ya,1,true\n',
+        }
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt in (None, "csv"):
+                for kind, data in inputs.items():
+                    csv_path = Path(directory) / f"{kind}.csv"
+                    csv_path.write_bytes(data)
+                    output = Path(directory) / f"{kind}.jsonl"
+                    errors = Path(directory) / f"{kind}-errors.jsonl"
+                    output.write_bytes(b"previous output bytes\n")
+                    source_before = csv_path.read_bytes()
+                    run = run_cli(csv_path, output, errors, fmt=fmt)
+                    self.assertEqual(run.returncode, 2, run.stderr)
+                    self.assertEqual(run.stderr, "")
+                    payload = json.loads(run.stdout)
+                    self.assertEqual(set(payload), {"error"})
+                    self.assertTrue(payload["error"].strip())
+                    self.assertIn("CSV parse error", payload["error"])
+                    self.assertIn(str(csv_path), payload["error"])
+                    self.assertIn("physical line 4", payload["error"])
+                    if kind == "unterminated":
+                        self.assertIn("unterminated", payload["error"])
+                    else:
+                        self.assertIn("unexpected character after closing quote",
+                                      payload["error"])
+                    # pre-existing files keep their bytes; the input is untouched
+                    self.assertEqual(output.read_bytes(), b"previous output bytes\n")
+                    self.assertFalse(errors.exists())
+                    self.assertEqual(csv_path.read_bytes(), source_before)
+
+    def test_cli_csv_quote_error_creates_no_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'name,orders,active\nMaya,3,"true')
+            output, errors = Path(directory) / "new.jsonl", Path(directory) / "new-errors.jsonl"
+            run = run_cli(csv_path, output, errors)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+            self.assertFalse(output.exists())
+            self.assertFalse(errors.exists())
+            self.assertEqual(hidden_entries(directory), [])
+
     def test_source_mapping(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             csv_path = self.write_csv(directory, "display_name,purchase_count,active\nMaya,3,TRUE\n")
