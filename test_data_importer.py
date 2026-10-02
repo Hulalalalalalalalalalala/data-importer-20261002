@@ -1683,6 +1683,279 @@ class JsonlImporterTests(unittest.TestCase):
                 self.assertFalse(errors.exists())
 
 
+class MissingValuesTests(unittest.TestCase):
+    """Per-column text markers treated as missing before type conversion.
+
+    The CSV and JSONL samples below are equivalent offline fixtures: the
+    same logical rows in each format must produce the same records, the
+    same enum/type field errors and the same filter/duplicate outcomes.
+    """
+
+    def setUp(self):
+        self.schema = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer",
+             "missing_values": ["N/A"], "default": 3, "allowed_values": [0, 3]},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+
+    def write_source(self, directory, fmt, text):
+        path = Path(directory) / f"source.{fmt}"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def normalize(self, directory, fmt, text, schema=None, **kwargs):
+        path = self.write_source(directory, fmt, text)
+        normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+        return normalize(path, schema if schema is not None else self.schema, **kwargs)
+
+    def normalize_both(self, directory, csv_text, jsonl_text, schema=None, **kwargs):
+        return (self.normalize(directory, "csv", csv_text, schema, **kwargs),
+                self.normalize(directory, "jsonl", jsonl_text, schema, **kwargs))
+
+    ENUM_CSV = ("name,orders,active\n"
+                "a, N/A ,true\n"
+                'b,"3",true\n'
+                "c,0,false\n"
+                "d,4,true\n"
+                "e,bad,true\n")
+    ENUM_JSONL = ('{"name": "a", "orders": " N/A ", "active": true}\n'
+                  '{"name": "b", "orders": "3", "active": true}\n'
+                  '{"name": "c", "orders": 0, "active": false}\n'
+                  '{"name": "d", "orders": 4, "active": true}\n'
+                  '{"name": "e", "orders": "bad", "active": true}\n')
+
+    def test_marker_default_and_enum_agree_across_formats(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_result, jsonl_result = self.normalize_both(
+                directory, self.ENUM_CSV, self.ENUM_JSONL)
+        # JSONL has no header line, so its physical row numbers are one less
+        self.assertEqual([row["row"] for row in csv_result["errors"]], [5, 6])
+        self.assertEqual([row["row"] for row in jsonl_result["errors"]], [4, 5])
+        for result in (csv_result, jsonl_result):
+            # " N/A " and "3" both become integer 3 via the default; 0 stays 0
+            self.assertEqual((result["accepted"], result["rejected"]), (3, 2))
+            self.assertEqual([record["orders"] for record in result["records"]], [3, 3, 0])
+            self.assertEqual([record["name"] for record in result["records"]],
+                             ["a", "b", "c"])
+            # 4 fails the enum check; "bad" reports only the type error
+            self.assertEqual(result["errors"][0]["errors"],
+                             ["orders: value 4 is not one of allowed_values [0, 3]"])
+            type_error = result["errors"][1]["errors"]
+            self.assertEqual(len(type_error), 1)
+            self.assertTrue(type_error[0].startswith("orders:"))
+            self.assertNotIn("allowed_values", type_error[0])
+
+    def test_markers_match_case_sensitively(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer",
+             "missing_values": ["n/a"], "default": 3},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_result, jsonl_result = self.normalize_both(
+                directory,
+                "name,orders,active\na,n/a,true\nb,N/A,true\n",
+                '{"name": "a", "orders": "n/a", "active": true}\n'
+                '{"name": "b", "orders": "N/A", "active": true}\n',
+                schema)
+        for result, error_row in ((csv_result, 3), (jsonl_result, 2)):
+            # only the exact "n/a" marker hits; "N/A" is an integer type error
+            self.assertEqual((result["accepted"], result["rejected"]), (1, 1))
+            self.assertEqual(result["records"], [{"name": "a", "orders": 3, "active": True}])
+            self.assertEqual(result["errors"][0]["row"], error_row)
+            self.assertTrue(result["errors"][0]["errors"][0].startswith("orders:"))
+
+    def test_marker_final_value_feeds_filter_and_duplicates(self):
+        csv_text = ("name,orders,active\n"
+                    "a,N/A,true\n"
+                    "b,0,true\n"
+                    "c,3,true\n"
+                    "bad,x,true\n"
+                    "d, N/A ,false\n")
+        jsonl_text = ('{"name": "a", "orders": "N/A", "active": true}\n'
+                      '{"name": "b", "orders": 0, "active": true}\n'
+                      '{"name": "c", "orders": "3", "active": true}\n'
+                      '{"name": "bad", "orders": "x", "active": true}\n'
+                      '{"name": "d", "orders": " N/A ", "active": false}\n')
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_result, jsonl_result = self.normalize_both(
+                directory, csv_text, jsonl_text,
+                duplicate_by=["orders"],
+                filter_eq={"field": "orders", "value": 3})
+            # the bad row is physical line 5 in CSV (header is line 1), 4 in JSONL
+            self.assertEqual(csv_result["errors"][0]["row"], 5)
+            self.assertEqual(jsonl_result["errors"][0]["row"], 4)
+            for result in (csv_result, jsonl_result):
+                # marker rows carry the default 3 into the filter and the
+                # duplicate report; record numbers count kept records only
+                self.assertEqual((result["accepted"], result["filtered"],
+                                  result["rejected"]), (3, 1, 1))
+                self.assertEqual([r["name"] for r in result["records"]], ["a", "c", "d"])
+                self.assertEqual(result["duplicates"],
+                                 [{"key": {"orders": 3}, "record_numbers": [1, 2, 3]}])
+
+    def test_marker_without_default_optional_null_required_error(self):
+        optional = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "missing_values": ["N/A"]},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        required = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "required": True,
+             "missing_values": ["N/A"]},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        csv_text = "name,orders,active\na,N/A,true\n"
+        jsonl_text = '{"name": "a", "orders": "N/A", "active": true}\n'
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for result in self.normalize_both(directory, csv_text, jsonl_text, optional):
+                self.assertEqual(result["records"],
+                                 [{"name": "a", "orders": None, "active": True}])
+                self.assertEqual((result["accepted"], result["rejected"]), (1, 0))
+            for result in self.normalize_both(directory, csv_text, jsonl_text, required):
+                self.assertEqual((result["accepted"], result["rejected"]), (0, 1))
+                self.assertEqual(result["errors"][0]["errors"],
+                                 ["orders: required value is empty"])
+
+    def test_jsonl_non_string_values_never_match_markers(self):
+        schema = {"columns": [
+            {"name": "orders", "type": "integer",
+             "missing_values": ["1", "null", "true", "[1]"]},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            result = self.normalize(
+                directory, "jsonl",
+                '{"orders": 1}\n'       # a number is not text: stays 1
+                '{"orders": "1"}\n'     # the string marker hits: null
+                '{"orders": null}\n'    # JSON null keeps its old semantics
+                '{"orders": true}\n'    # booleans are never rendered as text
+                '{"orders": [1]}\n',    # arrays are never rendered as text
+                schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (3, 2))
+        self.assertEqual([record["orders"] for record in result["records"]], [1, None, None])
+        self.assertEqual([row["row"] for row in result["errors"]], [4, 5])
+        for row in result["errors"]:
+            self.assertEqual(row["errors"], ["orders: expected integer"])
+
+    def test_markers_do_not_relax_structure_checks(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_result = self.normalize(
+                directory, "csv", "name,orders,active\na,N/A\n")
+            self.assertEqual(csv_result["errors"][0]["errors"], ["wrong number of cells"])
+            jsonl_result = self.normalize(
+                directory, "jsonl",
+                '{"name": "a", "orders": "N/A", "active": true, "active": false}\n'
+                '{"name": "a", "orders": "N/A"}\n')
+        self.assertEqual(jsonl_result["rejected"], 2)
+        self.assertTrue(jsonl_result["errors"][0]["errors"][0].startswith(
+            "structure error: duplicate key"))
+        self.assertTrue(jsonl_result["errors"][1]["errors"][0].startswith(
+            "structure error: missing source keys"))
+
+    def test_default_value_is_not_rematched_against_markers(self):
+        schema = {"columns": [{"name": "f", "type": "string",
+                               "missing_values": ["N/A"], "default": " N/A "}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            # an empty cell takes the default verbatim; it is not re-treated
+            # as missing even though it equals the declared marker
+            for result in self.normalize_both(
+                    directory, "f\n \n", '{"f": ""}\n', schema):
+                self.assertEqual(result["records"], [{"f": "N/A"}])
+
+    def test_invalid_missing_values_raise_before_reading(self):
+        import copy
+        missing = {"csv": ROOT / "samples" / "does-not-exist.csv",
+                   "jsonl": ROOT / "samples" / "does-not-exist.jsonl"}
+        bad_attributes = ["N/A", [], {}, None, True, 3]
+        bad_entries = [[3], [None], [True], [["N/A"]], [""], ["   "],
+                       ["N/A", "N/A"], ["N/A", " N/A "]]
+        for values in bad_attributes + bad_entries:
+            schema = {"columns": [{"name": "orders", "type": "integer",
+                                   "missing_values": values}]}
+            snapshot = copy.deepcopy(schema)
+            for normalize, fmt in ((normalize_csv, "csv"), (normalize_jsonl, "jsonl")):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing[fmt], schema)
+                message = str(caught.exception)
+                self.assertIn("missing_values", message, (values, message))
+                self.assertIn("orders", message, (values, message))
+                if isinstance(values, list) and values:
+                    # entry problems name the offending entry verbatim
+                    self.assertTrue(any(repr(entry) in message for entry in values),
+                                    (values, message))
+                else:
+                    self.assertIn(repr(values), message, (values, message))
+            self.assertEqual(schema, snapshot)
+
+    def test_schema_not_mutated_by_successful_run(self):
+        import copy
+        snapshot = copy.deepcopy(self.schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            self.normalize_both(directory, self.ENUM_CSV, self.ENUM_JSONL)
+        self.assertEqual(self.schema, snapshot)
+
+    def test_cli_bad_missing_values_exit_two_keeps_files(self):
+        bad_schema = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "missing_values": ["N/A", " N/A "]},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = self.write_source(
+                    directory, fmt,
+                    "name,orders,active\nA,3,true\n" if fmt == "csv"
+                    else '{"name": "A", "orders": 3, "active": true}\n')
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps(bad_schema), encoding="utf-8")
+                output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+                output.write_text("keep me\n", encoding="utf-8")
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("missing_values", payload["error"])
+                self.assertIn("orders", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
+                self.assertEqual(json.loads(schema_path.read_text(encoding="utf-8")),
+                                 bad_schema)
+
+    def test_cli_missing_values_applied_in_both_formats(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = self.write_source(
+                    directory, fmt,
+                    ("name,orders,active\na,N/A,true\nb,3,true\nc,0,false\n"
+                     if fmt == "csv" else
+                     '{"name": "a", "orders": "N/A", "active": true}\n'
+                     '{"name": "b", "orders": "3", "active": true}\n'
+                     '{"name": "c", "orders": 0, "active": false}\n'))
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps(self.schema), encoding="utf-8")
+                output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt,
+                           "--filter-eq", json.dumps({"field": "orders", "value": 3}),
+                           "--duplicate-by", "orders"]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(json.loads(run.stdout), {
+                    "accepted": 2, "rejected": 0, "filtered": 1,
+                    "duplicates": [{"key": {"orders": 3}, "record_numbers": [1, 2]}]})
+                records = [json.loads(line) for line in output.read_text().splitlines()]
+                self.assertEqual([record["orders"] for record in records], [3, 3])
+                self.assertEqual(errors.read_text(encoding="utf-8"), "")
+
+
 class SchemaStructureTests(unittest.TestCase):
     """Malformed schema shapes raise a clear ValueError before the data
     file is opened, identically for normalize_csv and normalize_jsonl."""

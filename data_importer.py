@@ -102,6 +102,43 @@ def _prepare_allowed_values(columns, defaults):
     return allowed
 
 
+def _prepare_missing_values(columns):
+    """Validate the optional ``missing_values`` list of each column.
+
+    Returns a mapping of output field name to a frozenset of the declared
+    text markers, each trimmed of surrounding whitespace. The attribute
+    must be a non-empty list of strings; an entry that trims to empty or
+    repeats another entry (compared case-sensitively after trimming) is
+    invalid. Raises ValueError naming ``missing_values``, the output
+    field and the offending value before the input is read; the caller's
+    schema is never mutated.
+    """
+    missing = {}
+    for column in columns:
+        name = column["name"]
+        if "missing_values" not in column:
+            continue
+        values = column["missing_values"]
+        if not isinstance(values, list) or not values:
+            raise ValueError(
+                f"column {name!r} missing_values {values!r} must be a non-empty list")
+        markers = set()
+        for entry in values:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"column {name!r} missing_values entry {entry!r} must be a string")
+            marker = entry.strip()
+            if not marker:
+                raise ValueError(
+                    f"column {name!r} missing_values entry {entry!r} must not be blank")
+            if marker in markers:
+                raise ValueError(
+                    f"column {name!r} missing_values entry {entry!r} is repeated")
+            markers.add(marker)
+        missing[name] = frozenset(markers)
+    return missing
+
+
 def _validate_schema_structure(schema):
     """Validate the structural shape of the schema before any file is read.
 
@@ -155,6 +192,7 @@ def _prepare_schema(schema):
     columns = schema["columns"]
     defaults = _prepare_defaults(columns)
     allowed = _prepare_allowed_values(columns, defaults)
+    missing = _prepare_missing_values(columns)
     sources = []
     for column in columns:
         name = column["name"]
@@ -171,7 +209,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed
+    return columns, sources, defaults, allowed, missing
 
 
 def _prepare_duplicate_by(duplicate_by, names):
@@ -305,7 +343,7 @@ def _csv_error_reason(exc):
 
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults, allowed = _prepare_schema(schema)
+    columns, sources, defaults, allowed, missing = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -350,7 +388,11 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                         name, kind = column["name"], column["type"]
                         value = value.strip()
                         try:
-                            if not value:
+                            # A trimmed cell equal to a declared missing
+                            # marker takes the ordinary empty-value path
+                            # (default, required error or null) before any
+                            # type conversion runs.
+                            if not value or value in missing.get(name, ()):
                                 if name in defaults:
                                     converted = defaults[name]
                                 elif column.get("required", False):
@@ -385,11 +427,15 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
     return _build_result(records, errors, duplicate_fields, filter_condition)
 
 
-def _convert_jsonl_value(column, value, defaults):
+def _convert_jsonl_value(column, value, defaults, missing):
     """Convert one decoded JSON value. Returns (converted, error_message)."""
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
         value = value.strip()
+        # Only genuine JSON strings take part in marker matching; numbers,
+        # booleans, arrays, objects and null are never rendered as text.
+        if value in missing.get(name, ()):
+            value = ""
     if value is None or value == "":
         if name in defaults:
             return defaults[name], None
@@ -421,7 +467,7 @@ def _convert_jsonl_value(column, value, defaults):
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults, allowed = _prepare_schema(schema)
+    columns, sources, defaults, allowed, missing_markers = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -472,7 +518,8 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
                 continue
             record = {}
             for column, origin in zip(columns, sources):
-                converted, message = _convert_jsonl_value(column, obj[origin], defaults)
+                converted, message = _convert_jsonl_value(
+                    column, obj[origin], defaults, missing_markers)
                 if message is not None:
                     row_errors.append(message)
                     continue
