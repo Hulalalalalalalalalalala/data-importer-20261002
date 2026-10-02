@@ -457,6 +457,65 @@ def _write_jsonl_outputs_atomic(output_path, records, errors_path, errors):
                 backup.unlink()
 
 
+def _inspect_path_identity(label, path):
+    """Return (resolved path, stat result) for one CLI path.
+
+    The stat follows symlinks, matching the file a later open would
+    touch. A nonexistent path yields ``None`` so nonexistent outputs
+    keep the resolved-path comparison rule; any other I/O error (for
+    example a permission denial) is surfaced because it makes the
+    alias check impossible to complete. Nothing is created.
+    """
+    try:
+        resolved = path.resolve()
+        stat_result = path.stat()
+    except FileNotFoundError:
+        stat_result = None
+    except OSError as exc:
+        raise OSError(f"cannot inspect {label} path {path}: {exc}") from None
+    return resolved, stat_result
+
+
+def _ensure_outputs_isolated(source, schema, output, errors):
+    """Reject output aliases before reading inputs or writing results.
+
+    Either output must not share an existing file with either input or
+    with the other output: same (device, inode) identity covers hard
+    links and symlinks, and resolved-path equality covers identical
+    paths, including outputs that do not exist yet and symlinked
+    aliases. Relative and absolute paths mix freely; file names and
+    contents are never compared. Raises ValueError naming the
+    conflicting paths, or OSError naming a path that could not be
+    inspected.
+    """
+    entries = [
+        ("source", Path(source)),
+        ("schema", Path(schema)),
+        ("records output", Path(output)),
+        ("errors output", Path(errors)),
+    ]
+    identities = [_inspect_path_identity(label, path) for label, path in entries]
+    # Only pairs involving an output are in scope: source vs schema and
+    # the two inputs against each other are never rejected here.
+    pairs = ((2, 3), (2, 0), (2, 1), (3, 0), (3, 1))
+    for left, right in pairs:
+        left_label, left_path = entries[left]
+        right_label, right_path = entries[right]
+        left_resolved, left_stat = identities[left]
+        right_resolved, right_stat = identities[right]
+        if left_resolved == right_resolved:
+            raise ValueError(
+                f"{left_label} path {left_path} and {right_label} path {right_path} "
+                "resolve to the same path")
+        if left_stat is not None and right_stat is not None:
+            left_identity = (left_stat.st_dev, left_stat.st_ino)
+            right_identity = (right_stat.st_dev, right_stat.st_ino)
+            if left_identity == right_identity:
+                raise ValueError(
+                    f"{left_label} path {left_path} and {right_label} path {right_path} "
+                    "point to the same existing file")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source")
@@ -470,10 +529,7 @@ def main():
                         help='equality condition as JSON, e.g. {"field": "active", "value": true}')
     args = parser.parse_args()
     try:
-        destinations = [Path(args.output).resolve(), Path(args.errors).resolve()]
-        inputs = [Path(args.source).resolve(), Path(args.schema).resolve()]
-        if destinations[0] == destinations[1] or any(path in inputs for path in destinations):
-            raise ValueError("output paths must be distinct from each other and inputs")
+        _ensure_outputs_isolated(args.source, args.schema, args.output, args.errors)
         if args.format not in ("csv", "jsonl"):
             raise ValueError("format must be csv or jsonl")
         filter_eq = None
