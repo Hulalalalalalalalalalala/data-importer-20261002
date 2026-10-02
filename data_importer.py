@@ -1,7 +1,10 @@
 """Normalize CSV rows or JSONL objects using a small explicit schema."""
 import argparse
+import contextlib
 import csv
 import json
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -228,6 +231,135 @@ def write_jsonl(path, records):
     Path(path).write_text("".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records), encoding="utf-8")
 
 
+def _stage_jsonl(destination, records):
+    """Serialize records into a temp file in the destination's directory.
+
+    Parent directories are never created and the destination is not
+    touched. Returns (staged_path, existed); raised OSError names the
+    target path.
+    """
+    target = Path(destination)
+    parent = target.parent
+    if not parent.exists() or not parent.is_dir():
+        raise OSError(f"cannot write {target}: parent directory does not exist")
+    if target.exists() and target.is_dir():
+        raise OSError(f"cannot write {target}: target is a directory")
+    if target.exists() and not os.access(target, os.W_OK):
+        raise OSError(f"cannot write {target}: target is not writable")
+    payload = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records)
+    try:
+        handle, staged_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=parent)
+    except OSError as exc:
+        raise OSError(f"cannot write {target}: {exc}") from None
+    staged = parent / staged_name
+    try:
+        out = os.fdopen(handle, "w", encoding="utf-8", newline="")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(handle)
+        with contextlib.suppress(OSError):
+            staged.unlink()
+        raise
+    try:
+        with out:
+            out.write(payload)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            staged.unlink()
+        raise OSError(f"cannot write {target}: {exc}") from None
+    except BaseException:
+        with contextlib.suppress(OSError):
+            staged.unlink()
+        raise
+    return staged, target.exists() and not target.is_dir()
+
+
+def _install_staged(target, staged, existed):
+    """Replace target with staged, keeping its old bytes recoverable.
+
+    Returns the backup path (or None). If the swap fails after the
+    original was moved aside, the original is restored at target before
+    the OSError (naming target) is raised.
+    """
+    mode = None
+    backup = None
+    try:
+        if existed:
+            mode = target.stat().st_mode & 0o7777
+            # Reserve a unique backup name so an unrelated user file can
+            # never be clobbered; os.replace below overwrites the empty
+            # placeholder with the original file.
+            backup_handle, backup_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".backup", dir=target.parent)
+            os.close(backup_handle)
+            backup = target.parent / backup_name
+            os.replace(target, backup)
+        os.replace(staged, target)
+        if mode is not None:
+            with contextlib.suppress(OSError):
+                target.chmod(mode)
+        else:
+            # mkstemp creates 0600; a freshly created output historically
+            # got the usual 0666 & ~umask mode from open().
+            umask = os.umask(0)
+            os.umask(umask)
+            with contextlib.suppress(OSError):
+                target.chmod(0o666 & ~umask)
+    except OSError as exc:
+        if backup is not None:
+            if target.exists():
+                # The original never left target; just drop the placeholder.
+                with contextlib.suppress(OSError):
+                    backup.unlink()
+            else:
+                with contextlib.suppress(OSError):
+                    os.replace(backup, target)
+        raise OSError(f"cannot write {target}: {exc}") from None
+    return backup
+
+
+def _write_jsonl_outputs_atomic(output_path, records, errors_path, errors):
+    """Write both JSONL outputs as one all-or-nothing operation.
+
+    Either both files are fully written (replacing existing files), or a
+    filesystem failure leaves every target exactly as it was beforehand:
+    pre-existing files keep their bytes and previously absent files stay
+    absent. Parent directories are never created.
+    """
+    output_target, errors_target = Path(output_path), Path(errors_path)
+    staged_output, output_existed = _stage_jsonl(output_target, records)
+    try:
+        staged_errors, errors_existed = _stage_jsonl(errors_target, errors)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            staged_output.unlink()
+        raise
+    installs = []
+    try:
+        installs.append((output_target,
+                         _install_staged(output_target, staged_output, output_existed)))
+        installs.append((errors_target,
+                         _install_staged(errors_target, staged_errors, errors_existed)))
+    except BaseException:
+        # Undo only fully completed installs; a failed _install_staged
+        # has already restored that target itself.
+        for target, backup in installs:
+            with contextlib.suppress(OSError):
+                if backup is not None:
+                    os.replace(backup, target)
+                else:
+                    target.unlink()
+        for leftover in (staged_errors, staged_output):
+            with contextlib.suppress(OSError):
+                leftover.unlink()
+        raise
+    for _, backup in installs:
+        if backup is not None:
+            with contextlib.suppress(OSError):
+                backup.unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source")
@@ -248,8 +380,7 @@ def main():
         normalize = normalize_csv if args.format == "csv" else normalize_jsonl
         result = normalize(args.source, json.loads(Path(args.schema).read_text(encoding="utf-8")),
                            duplicate_by=args.duplicate_by)
-        write_jsonl(args.output, result["records"])
-        write_jsonl(args.errors, result["errors"])
+        _write_jsonl_outputs_atomic(args.output, result["records"], args.errors, result["errors"])
         summary = {"accepted": result["accepted"], "rejected": result["rejected"]}
         if args.duplicate_by is not None:
             summary["duplicates"] = result["duplicates"]

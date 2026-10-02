@@ -1,12 +1,28 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from data_importer import normalize_csv, normalize_jsonl
+from data_importer import normalize_csv, normalize_jsonl, write_jsonl
 
 ROOT = Path(__file__).resolve().parent
+
+
+def run_cli(source, output, errors, fmt=None, extra=()):
+    command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+               "--schema", str(ROOT / "samples/schema.json"),
+               "--output", str(output), "--errors", str(errors)]
+    if fmt is not None:
+        command += ["--format", fmt]
+    command += list(extra)
+    return subprocess.run(command, capture_output=True, text=True)
+
+
+def hidden_entries(directory):
+    return [path.name for path in Path(directory).iterdir() if path.name.startswith(".")]
+
 
 
 class ImporterTests(unittest.TestCase):
@@ -562,6 +578,157 @@ class JsonlImporterTests(unittest.TestCase):
                 ]})
             self.assertEqual(len(output.read_text().splitlines()), 4)
             self.assertEqual(errors.read_text(encoding="utf-8"), "")
+
+
+class AtomicExportTests(unittest.TestCase):
+    """The two CLI outputs commit together or not at all."""
+
+    def trio_run(self, directory, fmt, *, output=None, errors=None, preseed_output=False):
+        source = ROOT / ("samples/trio.csv" if fmt == "csv" else "samples/trio.jsonl")
+        output = output or Path(directory) / "data.jsonl"
+        errors = errors or Path(directory) / "errors.jsonl"
+        old_bytes = b"previous output bytes\n"
+        if preseed_output:
+            output.write_bytes(old_bytes)
+        run = run_cli(source, output, errors, fmt=fmt)
+        return run, output, errors, old_bytes if preseed_output else None
+
+    def assert_error_payload(self, run, target):
+        self.assertEqual(run.returncode, 2, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(set(payload), {"error"})
+        self.assertIsInstance(payload["error"], str)
+        self.assertTrue(payload["error"].strip())
+        self.assertIn(str(target), payload["error"])
+
+    def assert_unchanged(self, path, old_bytes):
+        self.assertEqual(path.read_bytes(), old_bytes)
+
+    def test_normal_exports_for_both_formats(self):
+        for fmt, bad_row in (("csv", 4), ("jsonl", 3)):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                run, output, errors, _ = self.trio_run(directory, fmt, preseed_output=True)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(json.loads(run.stdout), {"accepted": 2, "rejected": 1})
+                records = [json.loads(line) for line in output.read_text().splitlines()]
+                self.assertEqual(records, [
+                    {"active": True, "name": "Maya", "orders": 3},
+                    {"active": False, "name": "Omar", "orders": None},
+                ])
+                error_rows = [json.loads(line) for line in errors.read_text().splitlines()]
+                self.assertEqual(len(error_rows), 1)
+                self.assertEqual(error_rows[0]["row"], bad_row)
+                self.assertTrue(any("orders" in message for message in error_rows[0]["errors"]))
+                self.assertEqual(hidden_entries(directory), [])
+
+    def test_success_replaces_existing_targets(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                run, output, errors, _ = self.trio_run(directory, fmt, preseed_output=True)
+                errors.write_text("stale errors\n", encoding="utf-8")
+                # Re-run: both pre-existing targets are replaced wholesale.
+                run = run_cli(ROOT / ("samples/trio.csv" if fmt == "csv" else "samples/trio.jsonl"),
+                              output, errors, fmt=fmt)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(len(output.read_text().splitlines()), 2)
+                fresh_errors = [json.loads(line) for line in errors.read_text().splitlines()]
+                self.assertTrue(fresh_errors[0]["errors"][0].startswith("orders:"))
+                self.assertEqual(hidden_entries(directory), [])
+
+    def test_missing_errors_parent_preserves_existing_output(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                run, output, errors, old_bytes = self.trio_run(
+                    directory, fmt, errors=Path(directory) / "nope" / "errors.jsonl",
+                    preseed_output=True)
+                self.assert_error_payload(run, errors)
+                self.assert_unchanged(output, old_bytes)
+                self.assertFalse(errors.exists())
+                self.assertFalse(Path(directory, "nope").exists())
+                self.assertEqual(hidden_entries(directory), [])
+
+    def test_missing_errors_parent_leaves_absent_output_absent(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                run, output, errors, _ = self.trio_run(
+                    directory, fmt, errors=Path(directory) / "nope" / "errors.jsonl")
+                self.assert_error_payload(run, errors)
+                self.assertFalse(output.exists())
+                self.assertFalse(errors.exists())
+                self.assertFalse(Path(directory, "nope").exists())
+                self.assertEqual(hidden_entries(directory), [])
+
+    def test_missing_output_parent_preserves_both_targets(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                output = Path(directory) / "nope" / "data.jsonl"
+                errors = Path(directory) / "errors.jsonl"
+                errors.write_bytes(b"old errors\n")
+                run = run_cli(ROOT / ("samples/trio.csv" if fmt == "csv" else "samples/trio.jsonl"),
+                              output, errors, fmt=fmt)
+                self.assert_error_payload(run, output)
+                self.assertFalse(output.exists())
+                self.assertEqual(errors.read_bytes(), b"old errors\n")
+                self.assertFalse(Path(directory, "nope").exists())
+                self.assertEqual(hidden_entries(directory), [])
+
+    def test_directory_targets_are_failures_without_side_effects(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = ROOT / ("samples/trio.csv" if fmt == "csv" else "samples/trio.jsonl")
+                # records target is a directory; errors target absent
+                output_dir = Path(directory) / "data.jsonl"
+                output_dir.mkdir()
+                errors = Path(directory) / "errors.jsonl"
+                run = run_cli(source, output_dir, errors, fmt=fmt)
+                self.assert_error_payload(run, output_dir)
+                self.assertTrue(output_dir.is_dir())
+                self.assertFalse(errors.exists())
+                # errors target is a directory while records target exists
+                output = Path(directory) / "records.jsonl"
+                output.write_bytes(b"keep records\n")
+                errors_dir = Path(directory) / "bad-errors"
+                errors_dir.mkdir()
+                run = run_cli(source, output, errors_dir, fmt=fmt)
+                self.assert_error_payload(run, errors_dir)
+                self.assertEqual(output.read_bytes(), b"keep records\n")
+                self.assertTrue(errors_dir.is_dir())
+                self.assertEqual(hidden_entries(directory), [])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root bypasses permission bits")
+    def test_unwritable_existing_target_is_preserved(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = ROOT / ("samples/trio.csv" if fmt == "csv" else "samples/trio.jsonl")
+                output = Path(directory) / "data.jsonl"
+                output.write_bytes(b"locked\n")
+                output.chmod(0o444)
+                errors = Path(directory) / "errors.jsonl"
+                try:
+                    run = run_cli(source, output, errors, fmt=fmt)
+                    self.assert_error_payload(run, output)
+                    self.assertEqual(output.read_bytes(), b"locked\n")
+                    self.assertFalse(errors.exists())
+                finally:
+                    output.chmod(0o644)
+
+    def test_source_and_schema_unchanged_by_failed_export(self):
+        source = ROOT / "samples/trio.csv"
+        schema = ROOT / "samples/schema.json"
+        source_before, schema_before = source.read_bytes(), schema.read_bytes()
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            run = run_cli(source, Path(directory) / "data.jsonl",
+                          Path(directory) / "nope" / "errors.jsonl")
+            self.assertEqual(run.returncode, 2)
+        self.assertEqual(source.read_bytes(), source_before)
+        self.assertEqual(schema.read_bytes(), schema_before)
+
+    def test_write_jsonl_independent_semantics_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "plain.jsonl"
+            write_jsonl(path, [{"b": 1, "a": None}, {"a": "x", "b": 2}])
+            self.assertEqual(path.read_text(encoding="utf-8"),
+                             '{"a": null, "b": 1}\n{"a": "x", "b": 2}\n')
 
 
 if __name__ == "__main__":
