@@ -580,6 +580,306 @@ class JsonlImporterTests(unittest.TestCase):
             self.assertEqual(errors.read_text(encoding="utf-8"), "")
 
 
+class FilterEqTests(unittest.TestCase):
+    """Single-field equality filtering for both input formats."""
+
+    CSV_TEXT = ("name,orders,active\n"
+                "Maya,3,true\n"      # 1 valid, orders 3, active true
+                "Omar,,false\n"      # 2 valid, orders null
+                "Nora,3,true\n"      # 3 valid, orders 3, active true
+                "Liam,bad,true\n"    # 4 invalid orders -> error
+                "Zoe,3,false\n")     # 5 valid, active false
+
+    JSONL_TEXT = ('{"name": "Maya", "orders": 3, "active": true}\n'
+                  '{"name": "Omar", "orders": null, "active": false}\n'
+                  '{"name": "Nora", "orders": "3", "active": true}\n'
+                  '\n'
+                  '{"name": "Liam", "orders": "bad", "active": true}\n'
+                  '{"name": "Zoe", "orders": 3, "active": false}\n'
+                  '{"name": "Amy", "orders": "", "active": true}\n')
+
+    def setUp(self):
+        self.schema = json.loads((ROOT / "samples/schema.json").read_text())
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        directory = Path(self.temp.name)
+        self.csv_path = directory / "data.csv"
+        self.csv_path.write_text(self.CSV_TEXT, encoding="utf-8")
+        self.jsonl_path = directory / "data.jsonl"
+        self.jsonl_path.write_text(self.JSONL_TEXT, encoding="utf-8")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def mapped_schema(self):
+        return {"columns": [
+            {"name": "name", "type": "string", "required": True, "source": "display_name"},
+            {"name": "orders", "type": "integer", "source": "purchase_count"},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+
+    def test_boolean_filter_counts_and_example(self):
+        # Three valid rows match active=true; one valid row is filtered out;
+        # the bad row is still an error: accepted 3... see per-format counts.
+        for fmt, path in (("csv", self.csv_path), ("jsonl", self.jsonl_path)):
+            with self.subTest(fmt=fmt):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema, filter_eq={"field": "active", "value": True})
+                if fmt == "csv":
+                    self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (2, 2, 1))
+                    self.assertEqual([r["name"] for r in result["records"]], ["Maya", "Nora"])
+                else:
+                    # Amy (orders "" -> null) is a fourth active=true row
+                    self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (3, 2, 1))
+                    self.assertEqual([r["name"] for r in result["records"]], ["Maya", "Nora", "Amy"])
+                self.assertEqual(result["errors"][0]["row"], 5)
+                # rejected rows are never hidden behind the filter
+                self.assertTrue(any("orders" in m for m in result["errors"][0]["errors"]))
+
+    def test_spec_example_two_matched_one_filtered_one_rejected(self):
+        # Three valid records, two of which match; one further error row.
+        text = ("name,orders,active\n"
+                "Maya,3,true\n"
+                "Omar,2,false\n"
+                "Nora,4,true\n"
+                "Liam,x,true\n")
+        path = Path(self.temp.name) / "spec.csv"
+        path.write_text(text, encoding="utf-8")
+        result = normalize_csv(path, self.schema, filter_eq={"field": "active", "value": True})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (2, 1, 1))
+        self.assertEqual([r["name"] for r in result["records"]], ["Maya", "Nora"])
+        self.assertEqual(result["errors"][0]["row"], 5)
+
+    def test_filter_does_not_count_mismatches_as_rejected(self):
+        result = normalize_csv(self.csv_path, self.schema,
+                               filter_eq={"field": "active", "value": True})
+        self.assertEqual(len(result["records"]), result["accepted"])
+        self.assertEqual(len(result["errors"]), result["rejected"])
+
+    def test_null_filter_matches_normalized_null_only(self):
+        result = normalize_csv(self.csv_path, self.schema,
+                               filter_eq={"field": "orders", "value": None})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (1, 3, 1))
+        self.assertEqual(result["records"], [{"name": "Omar", "orders": None, "active": False}])
+        # JSONL: null and an empty/whitespace string both normalize to null
+        result = normalize_jsonl(self.jsonl_path, self.schema,
+                                 filter_eq={"field": "orders", "value": None})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (2, 3, 1))
+        self.assertEqual([r["name"] for r in result["records"]], ["Omar", "Amy"])
+
+    def test_string_filter_is_case_sensitive_and_literal(self):
+        lower = normalize_csv(self.csv_path, self.schema,
+                              filter_eq={"field": "name", "value": "maya"})
+        self.assertEqual((lower["accepted"], lower["filtered"]), (0, 4))
+        padded = normalize_csv(self.csv_path, self.schema,
+                               filter_eq={"field": "name", "value": " Maya "})
+        self.assertEqual((padded["accepted"], padded["filtered"]), (0, 4))
+        exact = normalize_csv(self.csv_path, self.schema,
+                              filter_eq={"field": "name", "value": "Maya"})
+        self.assertEqual([r["name"] for r in exact["records"]], ["Maya"])
+        # empty string never equals a normalized value (those became null)
+        empty = normalize_csv(self.csv_path, self.schema,
+                              filter_eq={"field": "name", "value": ""})
+        self.assertEqual(empty["accepted"], 0)
+
+    def test_integer_type_boundaries(self):
+        match = normalize_csv(self.csv_path, self.schema,
+                              filter_eq={"field": "orders", "value": 3})
+        self.assertEqual([r["name"] for r in match["records"]], ["Maya", "Nora", "Zoe"])
+        # JSONL string "3" was converted to integer 3, so it matches too
+        match_j = normalize_jsonl(self.jsonl_path, self.schema,
+                                  filter_eq={"field": "orders", "value": 3})
+        self.assertEqual([r["name"] for r in match_j["records"]], ["Maya", "Nora", "Zoe"])
+        for bad in (True, False, 3.0, "3", [3]):
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(self.csv_path, self.schema,
+                              filter_eq={"field": "orders", "value": bad})
+            self.assertIn("filter_eq", str(caught.exception))
+
+    def test_boolean_and_string_value_type_boundaries(self):
+        with self.assertRaises(ValueError):
+            normalize_csv(self.csv_path, self.schema,
+                          filter_eq={"field": "active", "value": "true"})
+        with self.assertRaises(ValueError):
+            normalize_csv(self.csv_path, self.schema,
+                          filter_eq={"field": "active", "value": 1})
+        with self.assertRaises(ValueError):
+            normalize_csv(self.csv_path, self.schema,
+                          filter_eq={"field": "name", "value": 3})
+        with self.assertRaises(ValueError):
+            normalize_csv(self.csv_path, self.schema,
+                          filter_eq={"field": "name", "value": True})
+        # null is valid for every field type
+        for field in ("name", "orders", "active"):
+            normalize_csv(self.csv_path, self.schema,
+                          filter_eq={"field": field, "value": None})
+
+    def test_no_match_keeps_empty_records_with_errors_intact(self):
+        result = normalize_csv(self.csv_path, self.schema,
+                               filter_eq={"field": "name", "value": "nobody"})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (0, 4, 1))
+        self.assertEqual(result["records"], [])
+        self.assertEqual(len(result["errors"]), 1)
+
+    def test_duplicates_use_retained_records_renumbered_from_one(self):
+        # Zoe also has orders 3 but is filtered out; Liam is rejected; only
+        # Maya and Nora remain as duplicate positions 1 and 2.
+        result = normalize_csv(self.csv_path, self.schema, duplicate_by=["orders"],
+                               filter_eq={"field": "active", "value": True})
+        self.assertEqual(result["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2]}])
+        result_j = normalize_jsonl(self.jsonl_path, self.schema, duplicate_by=["orders"],
+                                   filter_eq={"field": "active", "value": True})
+        self.assertEqual(result_j["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2]}])
+        # null group forms over retained JSONL rows (Omar is filtered by
+        # active=true, so test it with the null filter instead)
+        null_groups = normalize_jsonl(self.jsonl_path, self.schema, duplicate_by=["orders"],
+                                      filter_eq={"field": "orders", "value": None})
+        self.assertEqual(null_groups["duplicates"],
+                         [{"key": {"orders": None}, "record_numbers": [1, 2]}])
+
+    def test_filtered_key_only_when_enabled(self):
+        self.assertNotIn("filtered", normalize_csv(self.csv_path, self.schema))
+        self.assertNotIn("filtered", normalize_csv(self.csv_path, self.schema, filter_eq=None))
+        enabled_zero = normalize_csv(self.csv_path, self.schema,
+                                     filter_eq={"field": "active", "value": True})
+        self.assertIn("filtered", enabled_zero)
+
+    def test_invalid_config_raises_before_reading_input(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        valid_object_cases = [
+            {"field": "active"},                       # missing value
+            {"value": True},                           # missing field
+            {},                                       # both missing
+            {"field": "active", "value": True, "x": 1},  # extra key
+            {"field": 3, "value": 1},                 # non-string field
+            {"field": "  ", "value": None},           # blank field
+            {"field": "nope", "value": None},         # unknown field
+            {"field": "orders", "value": True},       # bool for integer
+            {"field": "orders", "value": 3.5},        # float for integer
+            {"field": "active", "value": "true"},     # string for boolean
+            {"field": "name", "value": 1},            # integer for string
+        ]
+        for condition in valid_object_cases:
+            with self.subTest(condition=condition):
+                with self.assertRaises(ValueError) as caught:
+                    normalize_csv(missing, self.schema, filter_eq=condition)
+                message = str(caught.exception)
+                self.assertTrue("filter_eq" in message or str(condition.get("field", "")) in message,
+                                message)
+        # non-dict conditions
+        for condition in ([], "active", 3, True, [{"field": "active", "value": True}]):
+            with self.subTest(condition=condition):
+                with self.assertRaises(ValueError):
+                    normalize_csv(missing, self.schema, filter_eq=condition)
+        # field matches schema name literally; source aliases are unknown
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, self.mapped_schema(),
+                          filter_eq={"field": "purchase_count", "value": 3})
+        self.assertIn("purchase_count", str(caught.exception))
+
+    def test_repeated_runs_are_identical(self):
+        kwargs = {"duplicate_by": ["orders"], "filter_eq": {"field": "active", "value": True}}
+        first = normalize_jsonl(self.jsonl_path, self.schema, **kwargs)
+        second = normalize_jsonl(self.jsonl_path, self.schema, **kwargs)
+        self.assertEqual(first, second)
+
+    def test_cli_filter_summary_outputs_and_exit_codes(self):
+        for fmt, path in (("csv", self.csv_path), ("jsonl", self.jsonl_path)):
+            with self.subTest(fmt=fmt):
+                output = Path(self.temp.name) / f"out-{fmt}.jsonl"
+                errors = Path(self.temp.name) / f"err-{fmt}.jsonl"
+                run = run_cli(path, output, errors, fmt=fmt,
+                              extra=["--filter-eq", json.dumps({"field": "active", "value": True})])
+                self.assertEqual(run.returncode, 1, run.stderr)
+                summary = json.loads(run.stdout)
+                self.assertEqual(summary["rejected"], 1)
+                self.assertEqual(summary["filtered"], 2)
+                self.assertEqual(summary["accepted"], 2 if fmt == "csv" else 3)
+                self.assertEqual(len(output.read_text().splitlines()), summary["accepted"])
+                self.assertEqual(len(errors.read_text().splitlines()), 1)
+                self.assertNotIn("duplicates", summary)
+
+    def test_cli_all_filtered_no_errors_exit_zero_empty_files(self):
+        clean = Path(self.temp.name) / "clean.csv"
+        clean.write_text("name,orders,active\nA,1,true\nB,2,true\n", encoding="utf-8")
+        output = Path(self.temp.name) / "all-out.jsonl"
+        errors = Path(self.temp.name) / "all-err.jsonl"
+        run = run_cli(clean, output, errors,
+                      extra=["--filter-eq", json.dumps({"field": "active", "value": False})])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"accepted": 0, "rejected": 0, "filtered": 2})
+        self.assertEqual(output.read_text(encoding="utf-8"), "")
+        self.assertEqual(errors.read_text(encoding="utf-8"), "")
+
+    def test_cli_all_filtered_with_row_errors_exit_one(self):
+        output = Path(self.temp.name) / "none-out.jsonl"
+        errors = Path(self.temp.name) / "none-err.jsonl"
+        run = run_cli(self.csv_path, output, errors,
+                      extra=["--filter-eq", json.dumps({"field": "name", "value": "nobody"})])
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"accepted": 0, "rejected": 1, "filtered": 4})
+        self.assertEqual(output.read_text(encoding="utf-8"), "")
+        self.assertEqual(len(errors.read_text().splitlines()), 1)
+
+    def test_cli_filter_with_duplicate_by_renumbers_retained(self):
+        output = Path(self.temp.name) / "dup-out.jsonl"
+        errors = Path(self.temp.name) / "dup-err.jsonl"
+        run = run_cli(self.csv_path, output, errors,
+                      extra=["--duplicate-by", "orders",
+                             "--filter-eq", json.dumps({"field": "active", "value": True})])
+        self.assertEqual(run.returncode, 1, run.stderr)
+        summary = json.loads(run.stdout)
+        self.assertEqual(summary["accepted"], 2)
+        self.assertEqual(summary["filtered"], 2)
+        self.assertEqual(summary["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2]}])
+
+    def test_cli_bad_filter_eq_exit_two_creates_nothing(self):
+        conditions = ["{not json", "true", "false", "null", "42", '"active"', "[1, 2]",
+                      json.dumps({"field": "active"}),
+                      json.dumps({"field": "active", "value": True, "x": 1}),
+                      json.dumps({"field": "nope", "value": None}),
+                      json.dumps({"field": "orders", "value": True}),
+                      json.dumps({"field": "  ", "value": None})]
+        for index, raw in enumerate(conditions):
+            with self.subTest(raw=raw):
+                output = Path(self.temp.name) / f"bad-out-{index}.jsonl"
+                errors = Path(self.temp.name) / f"bad-err-{index}.jsonl"
+                run = run_cli(self.csv_path, output, errors, extra=["--filter-eq", raw])
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertFalse(output.exists())
+                self.assertFalse(errors.exists())
+
+    def test_cli_bad_filter_eq_preserves_existing_outputs(self):
+        output = Path(self.temp.name) / "keep-out.jsonl"
+        errors = Path(self.temp.name) / "keep-err.jsonl"
+        output.write_text("keep records\n", encoding="utf-8")
+        errors.write_text("keep errors\n", encoding="utf-8")
+        run = run_cli(self.csv_path, output, errors,
+                      extra=["--filter-eq", json.dumps({"field": "nope", "value": None})])
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(output.read_text(encoding="utf-8"), "keep records\n")
+        self.assertEqual(errors.read_text(encoding="utf-8"), "keep errors\n")
+
+    def test_cli_filter_reruns_are_identical(self):
+        output = Path(self.temp.name) / "rerun-out.jsonl"
+        errors = Path(self.temp.name) / "rerun-err.jsonl"
+        extra = ["--duplicate-by", "orders",
+                 "--filter-eq", json.dumps({"field": "active", "value": True})]
+        first = run_cli(self.csv_path, output, errors, extra=extra)
+        out_after_first, err_after_first = output.read_bytes(), errors.read_bytes()
+        second = run_cli(self.csv_path, output, errors, extra=extra)
+        self.assertEqual(first.stdout, second.stdout)
+        self.assertEqual(output.read_bytes(), out_after_first)
+        self.assertEqual(errors.read_bytes(), err_after_first)
+
+
 class AtomicExportTests(unittest.TestCase):
     """The two CLI outputs commit together or not at all."""
 
