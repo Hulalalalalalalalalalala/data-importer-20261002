@@ -1375,5 +1375,175 @@ class AtomicExportTests(unittest.TestCase):
                              '{"a": null, "b": 1}\n{"a": "x", "b": 2}\n')
 
 
+class PathIsolationTests(unittest.TestCase):
+    """Outputs must not alias the source/schema or each other.
+
+    Identity is the resolved pathname (same path or symlink alias) or, for
+    two existing files, the same device/inode pair -- so distinct hard
+    links to one file are refused, while independent files with identical
+    contents are allowed.
+    """
+
+    CSV_TEXT = ("name,orders,active\n"
+                "Maya,3,true\n"
+                "Omar,,false\n")
+    JSONL_TEXT = ('{"name": "Maya", "orders": 3, "active": true}\n'
+                  '{"name": "Omar", "orders": null, "active": false}\n')
+
+    def write_inputs(self, directory, fmt):
+        source = Path(directory, "data.csv" if fmt == "csv" else "data.jsonl")
+        source.write_text(self.CSV_TEXT if fmt == "csv" else self.JSONL_TEXT,
+                          encoding="utf-8")
+        schema = Path(directory, "schema.json")
+        schema.write_bytes((ROOT / "samples" / "schema.json").read_bytes())
+        return source, schema
+
+    def run_importer(self, directory, source, schema, output, errors, fmt=None):
+        command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                   "--schema", str(schema), "--output", str(output),
+                   "--errors", str(errors)]
+        if fmt is not None:
+            command += ["--format", fmt]
+        return subprocess.run(command, capture_output=True, text=True, cwd=directory)
+
+    def assert_isolation_error(self, run, *named):
+        self.assertEqual(run.returncode, 2, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(set(payload), {"error"})
+        self.assertTrue(payload["error"].strip())
+        self.assertNotIn("accepted", payload)
+        self.assertNotIn("rejected", payload)
+        for name in named:
+            self.assertIn(name, payload["error"])
+
+    def assert_same_file(self, left, right, links=2):
+        left_stat, right_stat = left.stat(), right.stat()
+        self.assertEqual((left_stat.st_dev, left_stat.st_nlink),
+                         (right_stat.st_dev, links))
+        self.assertEqual(left_stat.st_ino, right_stat.st_ino)
+
+    def test_each_output_hardlinked_to_each_input_is_rejected(self):
+        # Each output slot (records/errors) hard-linked to each input
+        # (source/schema): four pairings. The alias is passed as a relative
+        # path (from the CLI working directory), mixing spellings.
+        for fmt in ("csv", "jsonl"):
+            for alias_slot, input_role, alias_name, other_name in (
+                    ("records", "source", "out.csv", "errors.jsonl"),
+                    ("records", "schema", "out.json", "errors.jsonl"),
+                    ("errors", "source", "errors.csv", "out.jsonl"),
+                    ("errors", "schema", "errors.json", "out.jsonl")):
+                with self.subTest(fmt=fmt, slot=alias_slot, alias=input_role):
+                    with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                        source, schema = self.write_inputs(directory, fmt)
+                        input_path = source if input_role == "source" else schema
+                        input_name = ("data." + ("csv" if fmt == "csv" else "jsonl")
+                                      if input_role == "source" else "schema.json")
+                        alias, other = Path(directory, alias_name), Path(directory, other_name)
+                        os.link(input_path, alias)
+                        if alias_slot == "records":
+                            output, errors = alias, other
+                        else:
+                            output, errors = other, alias
+                        original = input_path.read_bytes()
+                        run = self.run_importer(
+                            directory, "data.csv" if fmt == "csv" else "data.jsonl",
+                            Path(directory, "schema.json"), output, errors, fmt)
+                        self.assert_isolation_error(run, alias_name, input_name)
+                        # Bytes, the hard-link relationship and link count
+                        # are all untouched; the other output was not made.
+                        self.assertEqual(input_path.read_bytes(), original)
+                        self.assertEqual(alias.read_bytes(), original)
+                        self.assert_same_file(input_path, alias)
+                        self.assertFalse(other.exists())
+
+    def test_two_existing_outputs_hardlinked_together_are_rejected(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source, schema = self.write_inputs(directory, fmt)
+                output = Path(directory, "a.jsonl")
+                errors = Path(directory, "b.jsonl")
+                output.write_bytes(b"previous output bytes\n")
+                os.link(output, errors)
+                run = self.run_importer(directory, source, schema, output, errors, fmt)
+                self.assert_isolation_error(run, "a.jsonl", "b.jsonl")
+                self.assertEqual(output.read_bytes(), b"previous output bytes\n")
+                self.assertEqual(errors.read_bytes(), b"previous output bytes\n")
+                self.assert_same_file(output, errors)
+
+    def test_identical_content_independent_files_are_allowed(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source, schema = self.write_inputs(directory, fmt)
+                twin = Path(directory, "twin")
+                twin.write_bytes(source.read_bytes())
+                self.assertNotEqual(source.stat().st_ino, twin.stat().st_ino)
+                errors = Path(directory, "errors.jsonl")
+                run = self.run_importer(directory, source, schema, twin, errors, fmt)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(json.loads(run.stdout), {"accepted": 2, "rejected": 0})
+                # The independent output was overwritten with JSONL; the
+                # source was not touched even though the bytes matched.
+                self.assertEqual(source.read_bytes(),
+                                 (self.CSV_TEXT if fmt == "csv" else self.JSONL_TEXT).encode())
+                records = [json.loads(line) for line in twin.read_text().splitlines()]
+                self.assertEqual([record["name"] for record in records], ["Maya", "Omar"])
+
+    def test_symlink_aliases_still_rejected_and_link_kept(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source, schema = self.write_inputs(directory, "csv")
+            link = Path(directory, "link.csv")
+            link.symlink_to(source.name)
+            errors = Path(directory, "errors.jsonl")
+            run = self.run_importer(directory, source, schema, link, errors)
+            self.assert_isolation_error(run, "link.csv", "data.csv")
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link), source.name)
+            self.assertFalse(errors.exists())
+            # two symlinks spelling one not-yet-existing output name
+            first, second = Path(directory, "l1"), Path(directory, "l2")
+            first.symlink_to("shared.jsonl")
+            second.symlink_to("shared.jsonl")
+            run = self.run_importer(directory, source, schema, first, second)
+            self.assert_isolation_error(run, "l1", "l2")
+            self.assertTrue(first.is_symlink() and second.is_symlink())
+            self.assertFalse((Path(directory, "shared.jsonl")).exists())
+
+    def test_same_output_pathname_still_rejected_without_creating_it(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source, schema = self.write_inputs(directory, "csv")
+            run = self.run_importer(directory, source, schema, "same.jsonl", "same.jsonl")
+            self.assert_isolation_error(run, "same.jsonl")
+            self.assertFalse((Path(directory, "same.jsonl")).exists())
+
+    def test_nonexistent_distinct_outputs_keep_pathname_rule_only(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source, schema = self.write_inputs(directory, "csv")
+            output, errors = Path(directory, "out.jsonl"), Path(directory, "err.jsonl")
+            run = self.run_importer(directory, source, schema, output, errors)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertTrue(output.exists() and errors.exists())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root bypasses permission bits")
+    def test_unstatable_path_is_io_error_exit_two_without_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source, _ = self.write_inputs(directory, "csv")
+            locked = Path(directory, "locked")
+            locked.mkdir()
+            hidden_schema = locked / "schema.json"
+            hidden_schema.write_bytes((ROOT / "samples" / "schema.json").read_bytes())
+            locked.chmod(0o000)
+            try:
+                output, errors = Path(directory, "out.jsonl"), Path(directory, "err.jsonl")
+                run = self.run_importer(directory, source, hidden_schema, output, errors)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertIn("schema.json", payload["error"])
+                self.assertFalse(output.exists() or errors.exists())
+            finally:
+                locked.chmod(0o755)
+
+
 if __name__ == "__main__":
     unittest.main()
