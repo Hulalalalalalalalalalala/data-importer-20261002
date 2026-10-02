@@ -41,6 +41,56 @@ def _prepare_defaults(columns):
     return defaults
 
 
+def _prepare_allowed_values(columns, defaults):
+    """Validate the optional ``allowed_values`` enumeration of each column.
+
+    Returns a mapping of output field name to a copy of the permitted
+    values. The attribute must be a non-empty list whose elements already
+    match the column's target type (non-boolean integers for ``integer``;
+    null, arrays and objects are never legal); string elements are kept
+    verbatim, never trimmed or case-folded, and elements repeated by
+    value equality are rejected. A declared default that is not listed is
+    a configuration error even when no input row would have used it. All
+    problems raise ValueError naming ``allowed_values`` and the output
+    field before the input is read; the caller's schema is never mutated.
+    """
+    allowed = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "allowed_values" not in column:
+            continue
+        values = column["allowed_values"]
+        if not isinstance(values, list):
+            raise ValueError(f"column {name!r} allowed_values must be a non-empty list")
+        if not values:
+            raise ValueError(f"column {name!r} allowed_values must not be empty")
+        seen = []
+        for element in values:
+            if kind == "string":
+                if not isinstance(element, str):
+                    raise ValueError(
+                        f"column {name!r} allowed_values element {element!r} must be a string")
+            elif kind == "integer":
+                if isinstance(element, bool) or not isinstance(element, int):
+                    raise ValueError(
+                        f"column {name!r} allowed_values element {element!r} "
+                        "must be a non-boolean integer")
+            else:
+                if not isinstance(element, bool):
+                    raise ValueError(
+                        f"column {name!r} allowed_values element {element!r} must be a boolean")
+            if element in seen:
+                raise ValueError(
+                    f"column {name!r} allowed_values element {element!r} is repeated")
+            seen.append(element)
+        allowed[name] = list(values)
+    for name, default in defaults.items():
+        if name in allowed and default not in allowed[name]:
+            raise ValueError(
+                f"column {name!r} default {default!r} is not in allowed_values")
+    return allowed
+
+
 def _prepare_schema(schema):
     columns = schema["columns"]
     names = [column["name"] for column in columns]
@@ -49,6 +99,7 @@ def _prepare_schema(schema):
     if any(column["type"] not in ("string", "integer", "boolean") for column in columns):
         raise ValueError("unsupported column type")
     defaults = _prepare_defaults(columns)
+    allowed = _prepare_allowed_values(columns, defaults)
     sources = []
     for column in columns:
         name = column["name"]
@@ -65,7 +116,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults
+    return columns, sources, defaults, allowed
 
 
 def _prepare_duplicate_by(duplicate_by, names):
@@ -166,8 +217,23 @@ def _build_result(records, errors, duplicate_fields, filter_condition):
     return result
 
 
+def _enum_violation(allowed, name, value):
+    """Return the allowed_values violation for a converted non-null value.
+
+    Null results (an optional empty value, or a required-empty failure
+    already reported by the caller) are exempt; a value equal to a listed
+    element passes. Returns None when the value is allowed, otherwise the
+    bare violation message mentioning ``allowed_values``.
+    """
+    if value is None or name not in allowed:
+        return None
+    if value not in allowed[name]:
+        return f"value {value!r} is not in allowed_values"
+    return None
+
+
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults = _prepare_schema(schema)
+    columns, sources, defaults, allowed = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -216,6 +282,9 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
                             record[name] = value.casefold() == "true"
                         else:
                             record[name] = value
+                        violation = _enum_violation(allowed, name, record[name])
+                        if violation is not None:
+                            raise ValueError(violation)
                     except ValueError as exc:
                         row_errors.append(f"{name}: {exc}")
             if row_errors:
@@ -261,7 +330,7 @@ def _convert_jsonl_value(column, value, defaults):
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
-    columns, sources, defaults = _prepare_schema(schema)
+    columns, sources, defaults, allowed = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
@@ -312,11 +381,16 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None):
                 continue
             record = {}
             for column, origin in zip(columns, sources):
+                name = column["name"]
                 converted, message = _convert_jsonl_value(column, obj[origin], defaults)
+                if message is None:
+                    violation = _enum_violation(allowed, name, converted)
+                    if violation is not None:
+                        message = f"{name}: {violation}"
                 if message is not None:
                     row_errors.append(message)
                 else:
-                    record[column["name"]] = converted
+                    record[name] = converted
             if row_errors:
                 errors.append({"row": row_number, "errors": row_errors})
             else:

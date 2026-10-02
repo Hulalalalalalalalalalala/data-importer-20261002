@@ -638,6 +638,205 @@ class ImporterTests(unittest.TestCase):
                 {"active": False, "name": "Maya", "orders": 3},
             ])
 
+    def enum_schema(self):
+        return {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "allowed_values": [0, 3], "default": 3},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+
+    def test_allowed_values_enum_csv(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,,true\n"
+                "b,3,true\n"
+                "c,0,false\n"
+                "d,4,true\n"
+                "e,bad,true\n")
+            result = normalize_csv(csv_path, self.enum_schema())
+        self.assertEqual((result["accepted"], result["rejected"]), (3, 2))
+        self.assertEqual([record["orders"] for record in result["records"]], [3, 3, 0])
+        self.assertEqual([row["row"] for row in result["errors"]], [5, 6])
+        enum_error = result["errors"][0]["errors"][0]
+        self.assertIn("orders", enum_error)
+        self.assertIn("allowed_values", enum_error)
+        # a non-empty value that fails conversion reports only the type error
+        type_error = result["errors"][1]["errors"][0]
+        self.assertIn("orders", type_error)
+        self.assertNotIn("allowed_values", type_error)
+
+    def test_allowed_values_string_entries_kept_verbatim_csv(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "allowed_values": ["Maya", " Omar "]},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name\nMaya\nmaya\n Omar \nOmar\n")
+            result = normalize_csv(csv_path, schema)
+        # input is trimmed during conversion; the entries are not, and case stays
+        self.assertEqual([record["name"] for record in result["records"]], ["Maya"])
+        self.assertEqual(result["rejected"], 3)
+
+    def test_allowed_values_boolean_and_null_exemption_csv(self):
+        schema = {"columns": [
+            {"name": "orders", "type": "integer", "allowed_values": [0, 3]},
+            {"name": "active", "type": "boolean", "required": True, "allowed_values": [True]},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "orders,active\n"
+                ",true\n"
+                "3,true\n"
+                "1,false\n"
+                "0,\n")
+            result = normalize_csv(csv_path, schema)
+        # optional empty stays null and is exempt; required empty keeps its error
+        self.assertEqual(result["records"][0]["orders"], None)
+        self.assertEqual((result["accepted"], result["rejected"]), (2, 2))
+        self.assertEqual(result["errors"][0]["errors"],
+                         ["orders: value 1 is not in allowed_values",
+                          "active: value False is not in allowed_values"])
+        self.assertEqual(result["errors"][1]["errors"], ["active: required value is empty"])
+
+    def test_allowed_values_invalid_config_raises_before_reading_csv(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        bad_lists = [None, 3, "x", {}, (), [], [None], [[1]], [{"a": 1}], [True],
+                     ["3"], [3.0], [0, 0], [3, 3]]
+        for values in bad_lists:
+            schema = {"columns": [{"name": "orders", "type": "integer",
+                                   "allowed_values": values}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("allowed_values", message, values)
+            self.assertIn("orders", message, values)
+        for kind, values in (("string", ["a", "a"]), ("boolean", [True, True]),
+                             ("boolean", [1]), ("string", [3])):
+            schema = {"columns": [{"name": "f", "type": kind, "allowed_values": values}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            self.assertIn("allowed_values", str(caught.exception), (kind, values))
+            self.assertIn("f", str(caught.exception), (kind, values))
+        # a processed default outside the list is a configuration error even
+        # when no input row would have used it
+        schema = {"columns": [{"name": "orders", "type": "integer",
+                               "allowed_values": [0, 3], "default": 4}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertIn("allowed_values", str(caught.exception))
+        self.assertIn("orders", str(caught.exception))
+
+    def test_allowed_values_schema_not_mutated_csv(self):
+        import copy
+        schema = self.enum_schema()
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\na,,true\nb,4,true\n")
+            normalize_csv(csv_path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_allowed_values_before_filter_and_duplicates_csv(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,3,true\n"
+                "b,4,true\n"
+                "c,,true\n"
+                "d,0,false\n")
+            result = normalize_csv(csv_path, self.enum_schema(), duplicate_by=["orders"],
+                                   filter_eq={"field": "active", "value": True})
+        # the enum-rejected row reaches errors and is never hidden by the filter
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (2, 1, 1))
+        self.assertEqual([r["name"] for r in result["records"]], ["a", "c"])
+        self.assertEqual(result["errors"][0]["row"], 3)
+        self.assertEqual(result["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2]}])
+
+    def test_allowed_values_csv_jsonl_results_consistent(self):
+        csv_text = ("name,orders,active\n"
+                    "a,,true\n"
+                    "b,3,true\n"
+                    "c,0,false\n"
+                    "d,4,true\n"
+                    "e,bad,true\n")
+        jsonl_text = ('{"name": "a", "orders": null, "active": true}\n'
+                      '{"name": "b", "orders": "3", "active": true}\n'
+                      '{"name": "c", "orders": 0, "active": false}\n'
+                      '{"name": "d", "orders": 4, "active": true}\n'
+                      '{"name": "e", "orders": "bad", "active": true}\n')
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, csv_text)
+            jsonl_path = Path(directory) / "data.jsonl"
+            jsonl_path.write_text(jsonl_text, encoding="utf-8")
+            csv_result = normalize_csv(csv_path, self.enum_schema())
+            jsonl_result = normalize_jsonl(jsonl_path, self.enum_schema())
+        self.assertEqual(csv_result["records"], jsonl_result["records"])
+        self.assertEqual((csv_result["accepted"], csv_result["rejected"]),
+                         (jsonl_result["accepted"], jsonl_result["rejected"]))
+        # the CSV header occupies physical line 1; enum messages themselves match
+        shifted = [{"row": row["row"] - 1, "errors": row["errors"]}
+                   for row in csv_result["errors"]]
+        for csv_row, jsonl_row in zip(shifted, jsonl_result["errors"]):
+            self.assertEqual(csv_row["row"], jsonl_row["row"])
+            for csv_message, jsonl_message in zip(csv_row["errors"], jsonl_row["errors"]):
+                if "allowed_values" in csv_message:
+                    self.assertEqual(csv_message, jsonl_message)
+
+    def test_cli_allowed_values_bad_config_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\nA,3,TRUE\n")
+            schema_path = Path(directory) / "schema.json"
+            bad_schemas = [
+                {"columns": [
+                    {"name": "name", "type": "string", "required": True},
+                    {"name": "orders", "type": "integer", "allowed_values": []},
+                    {"name": "active", "type": "boolean", "required": True}]},
+                {"columns": [
+                    {"name": "name", "type": "string", "required": True},
+                    {"name": "orders", "type": "integer", "allowed_values": [0, 3], "default": 4},
+                    {"name": "active", "type": "boolean", "required": True}]},
+            ]
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            for bad_schema in bad_schemas:
+                schema_path.write_text(json.dumps(bad_schema), encoding="utf-8")
+                output.write_text("keep me\n", encoding="utf-8")
+                if errors.exists():
+                    errors.unlink()
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(csv_path),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors)]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("allowed_values", payload["error"])
+                self.assertIn("orders", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
+
+    def test_cli_allowed_values_applied_and_exported(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory, "name,orders,active\na,,true\nb,0,false\nc,4,true\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(self.enum_schema()), encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(csv_path),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors)]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {"accepted": 2, "rejected": 1})
+            records = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual([record["orders"] for record in records], [3, 0])
+            error_rows = [json.loads(line) for line in errors.read_text().splitlines()]
+            self.assertEqual(error_rows[0]["row"], 4)
+            self.assertIn("allowed_values", error_rows[0]["errors"][0])
+
 
 class JsonlImporterTests(unittest.TestCase):
     def setUp(self):
@@ -1222,6 +1421,155 @@ class JsonlImporterTests(unittest.TestCase):
                 self.assertIn("filter_eq", payload["error"])
                 self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
                 self.assertFalse(errors.exists())
+
+
+    def enum_schema(self):
+        return {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "allowed_values": [0, 3], "default": 3},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+
+    def test_allowed_values_enum_jsonl(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": null, "active": true}\n'
+                '{"name": "b", "orders": "3", "active": true}\n'
+                '{"name": "c", "orders": 0, "active": false}\n'
+                '{"name": "d", "orders": 4, "active": true}\n'
+                '{"name": "e", "orders": "bad", "active": true}\n')
+            result = normalize_jsonl(path, self.enum_schema())
+        self.assertEqual((result["accepted"], result["rejected"]), (3, 2))
+        self.assertEqual([record["orders"] for record in result["records"]], [3, 3, 0])
+        self.assertEqual([row["row"] for row in result["errors"]], [4, 5])
+        enum_error = result["errors"][0]["errors"][0]
+        self.assertIn("orders", enum_error)
+        self.assertIn("allowed_values", enum_error)
+        type_error = result["errors"][1]["errors"][0]
+        self.assertIn("orders", type_error)
+        self.assertNotIn("allowed_values", type_error)
+
+    def test_allowed_values_jsonl_schema_order_and_null_exemption(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "allowed_values": ["x"]},
+            {"name": "orders", "type": "integer", "allowed_values": [0, 3]},
+            {"name": "active", "type": "boolean", "allowed_values": [True]},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "y", "orders": 7, "active": false}\n'
+                '{"name": "x", "orders": null, "active": true}\n')
+            result = normalize_jsonl(path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (1, 1))
+        self.assertIsNone(result["records"][0]["orders"])
+        prefixes = [message.split(":", 1)[0] for message in result["errors"][0]["errors"]]
+        self.assertEqual(prefixes, ["name", "orders", "active"])
+        self.assertTrue(all("allowed_values" in message
+                            for message in result["errors"][0]["errors"]))
+
+    def test_allowed_values_jsonl_structure_not_repaired(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "active": true}\n'
+                '{"name": "a", "orders": 4, "active": true, "extra": 1}\n')
+            result = normalize_jsonl(path, self.enum_schema())
+        self.assertEqual(result["rejected"], 2)
+        self.assertTrue(result["errors"][0]["errors"][0].startswith("structure error"))
+        self.assertTrue(result["errors"][1]["errors"][0].startswith("structure error"))
+
+    def test_allowed_values_invalid_config_raises_before_reading_jsonl(self):
+        import copy
+        missing = ROOT / "samples" / "does-not-exist.jsonl"
+        bad_lists = [None, 3, "x", {}, (), [], [None], [[1]], [{"a": 1}], [False],
+                     ["0"], [0.0], [0, 0], [3, 3]]
+        for values in bad_lists:
+            schema = {"columns": [{"name": "orders", "type": "integer",
+                                   "allowed_values": values}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_jsonl(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("allowed_values", message, values)
+            self.assertIn("orders", message, values)
+        schema = {"columns": [{"name": "orders", "type": "integer",
+                               "allowed_values": [0, 3], "default": 9}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_jsonl(missing, schema)
+        self.assertIn("allowed_values", str(caught.exception))
+        self.assertIn("orders", str(caught.exception))
+        # caller's schema is not mutated by validation or normalization
+        schema = self.enum_schema()
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(directory, '{"name": "a", "orders": 4, "active": true}\n')
+            normalize_jsonl(path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_allowed_values_jsonl_before_filter_and_duplicates(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": 3, "active": true}\n'
+                '{"name": "b", "orders": 4, "active": true}\n'
+                '{"name": "c", "orders": null, "active": true}\n'
+                '{"name": "d", "orders": 0, "active": false}\n')
+            result = normalize_jsonl(path, self.enum_schema(), duplicate_by=["orders"],
+                                     filter_eq={"field": "active", "value": True})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (2, 1, 1))
+        self.assertEqual([r["name"] for r in result["records"]], ["a", "c"])
+        self.assertEqual(result["errors"][0]["row"], 2)
+        self.assertEqual(result["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2]}])
+
+    def test_cli_jsonl_allowed_values_bad_config_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(directory, '{"name": "A", "orders": 1, "active": true}\n',
+                                    name="source.jsonl")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps({"columns": [
+                {"name": "name", "type": "string", "required": True},
+                {"name": "orders", "type": "integer", "allowed_values": [1, 1]},
+                {"name": "active", "type": "boolean", "required": True},
+            ]}), encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(path),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "jsonl"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertTrue(payload["error"].strip())
+            self.assertIn("allowed_values", payload["error"])
+            self.assertIn("orders", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+    def test_cli_jsonl_allowed_values_applied_and_exported(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": null, "active": true}\n'
+                '{"name": "b", "orders": 0, "active": false}\n'
+                '{"name": "c", "orders": 4, "active": true}\n',
+                name="source.jsonl")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(self.enum_schema()), encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(path),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "jsonl"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {"accepted": 2, "rejected": 1})
+            records = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual([record["orders"] for record in records], [3, 0])
+            error_rows = [json.loads(line) for line in errors.read_text().splitlines()]
+            self.assertEqual(error_rows[0]["row"], 3)
+            self.assertIn("allowed_values", error_rows[0]["errors"][0])
 
 
 class AtomicExportTests(unittest.TestCase):
