@@ -6,6 +6,7 @@ Start
 python3 data_importer.py samples/customers.csv --schema samples/schema.json --output customers.jsonl --errors errors.jsonl
 Prints accepted 2 and rejected 0; writes two JSONL rows.
 Add --format jsonl (e.g. with samples/customers.jsonl) to process JSONL; the default is csv and the extension is never inferred.
+Add repeatable --duplicate-by FIELD to report groups of valid records matching on the named output fields (e.g. --duplicate-by orders); duplicates are reported but never rejected or removed.
 
 Smoke Test
 python3 -B -m unittest -v

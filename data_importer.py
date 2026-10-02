@@ -31,8 +31,60 @@ def _prepare_schema(schema):
     return columns, sources
 
 
-def normalize_csv(source, schema):
+def _prepare_duplicate_by(duplicate_by, names):
+    """Validate the duplicate_by option against schema output names.
+
+    Matching is literal against schema ``name`` values; source names are not
+    accepted. Must run before the input is read.
+    """
+    if not isinstance(duplicate_by, list):
+        raise ValueError("duplicate_by must be a list of schema field names")
+    if not duplicate_by:
+        raise ValueError("duplicate_by must be a non-empty list")
+    seen = set()
+    for member in duplicate_by:
+        if not isinstance(member, str) or not member.strip():
+            raise ValueError(f"duplicate_by entry {member!r} must be a non-blank string")
+        if member not in names:
+            raise ValueError(f"duplicate_by entry {member!r} is not a schema field name")
+        if member in seen:
+            raise ValueError(f"duplicate_by entry {member!r} is listed more than once")
+        seen.add(member)
+    return list(duplicate_by)
+
+
+def _find_duplicates(records, duplicate_by):
+    """Group accepted records by the converted values of duplicate_by fields.
+
+    Keys compare mapped, trimmed and type-converted values, so an integer 3
+    equals the string "3" on an integer column; strings stay case-sensitive
+    and nulls compare equal. Groups keep first-occurrence order and carry
+    one-based indices into records, not input line numbers.
+    """
+    groups = {}
+    first_seen = []
+    for record_number, record in enumerate(records, start=1):
+        key = tuple(record[field] for field in duplicate_by)
+        if key in groups:
+            groups[key].append(record_number)
+        else:
+            groups[key] = [record_number]
+            first_seen.append(key)
+    duplicates = []
+    for key in first_seen:
+        record_numbers = groups[key]
+        if len(record_numbers) > 1:
+            duplicates.append({"key": dict(zip(duplicate_by, key)),
+                               "record_numbers": record_numbers})
+    return duplicates
+
+
+def normalize_csv(source, schema, duplicate_by=None):
     columns, sources = _prepare_schema(schema)
+    names = {column["name"] for column in columns}
+    duplicate_fields = None
+    if duplicate_by is not None:
+        duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     records, errors = [], []
     with Path(source).open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -66,7 +118,10 @@ def normalize_csv(source, schema):
                 errors.append({"row": row_number, "errors": row_errors})
             else:
                 records.append(record)
-    return {"records": records, "errors": errors, "accepted": len(records), "rejected": len(errors)}
+    result = {"records": records, "errors": errors, "accepted": len(records), "rejected": len(errors)}
+    if duplicate_fields is not None:
+        result["duplicates"] = _find_duplicates(records, duplicate_fields)
+    return result
 
 
 def _convert_jsonl_value(column, value):
@@ -102,8 +157,12 @@ def _convert_jsonl_value(column, value):
     return None, f"{name}: boolean must be true or false"
 
 
-def normalize_jsonl(source, schema):
+def normalize_jsonl(source, schema, duplicate_by=None):
     columns, sources = _prepare_schema(schema)
+    names = {column["name"] for column in columns}
+    duplicate_fields = None
+    if duplicate_by is not None:
+        duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     expected = set(sources)
     records, errors = [], []
     decoded_pairs = []
@@ -160,7 +219,10 @@ def normalize_jsonl(source, schema):
                 errors.append({"row": row_number, "errors": row_errors})
             else:
                 records.append(record)
-    return {"records": records, "errors": errors, "accepted": len(records), "rejected": len(errors)}
+    result = {"records": records, "errors": errors, "accepted": len(records), "rejected": len(errors)}
+    if duplicate_fields is not None:
+        result["duplicates"] = _find_duplicates(records, duplicate_fields)
+    return result
 
 
 def write_jsonl(path, records):
@@ -174,6 +236,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--errors", required=True)
     parser.add_argument("--format", default="csv", help="input format: csv (default) or jsonl")
+    parser.add_argument("--duplicate-by", action="append", default=None, metavar="FIELD",
+                        help="output field name for the duplicate report; repeatable")
     args = parser.parse_args()
     try:
         destinations = [Path(args.output).resolve(), Path(args.errors).resolve()]
@@ -183,10 +247,14 @@ def main():
         if args.format not in ("csv", "jsonl"):
             raise ValueError("format must be csv or jsonl")
         normalize = normalize_csv if args.format == "csv" else normalize_jsonl
-        result = normalize(args.source, json.loads(Path(args.schema).read_text(encoding="utf-8")))
+        result = normalize(args.source, json.loads(Path(args.schema).read_text(encoding="utf-8")),
+                           duplicate_by=args.duplicate_by)
         write_jsonl(args.output, result["records"])
         write_jsonl(args.errors, result["errors"])
-        print(json.dumps({"accepted": result["accepted"], "rejected": result["rejected"]}))
+        summary = {"accepted": result["accepted"], "rejected": result["rejected"]}
+        if "duplicates" in result:
+            summary["duplicates"] = result["duplicates"]
+        print(json.dumps(summary, ensure_ascii=False))
         return 1 if result["rejected"] else 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(json.dumps({"error": str(exc)}))
