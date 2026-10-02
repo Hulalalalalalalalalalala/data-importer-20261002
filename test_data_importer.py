@@ -1683,6 +1683,205 @@ class JsonlImporterTests(unittest.TestCase):
                 self.assertFalse(errors.exists())
 
 
+class SchemaStructureTests(unittest.TestCase):
+    """A malformed schema structure is one clear ValueError, raised by both
+    APIs before the data file is opened -- even when the source is missing."""
+
+    MISSING = {"csv": ROOT / "samples" / "does-not-exist.csv",
+               "jsonl": ROOT / "samples" / "does-not-exist.jsonl"}
+
+    def assert_structure_error(self, schema, *parts):
+        message = None
+        for fmt, normalize in (("csv", normalize_csv), ("jsonl", normalize_jsonl)):
+            with self.subTest(fmt=fmt, schema=schema):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(self.MISSING[fmt], schema)
+                message = str(caught.exception)
+                self.assertIn("schema", message)
+                for part in parts:
+                    self.assertIn(part, message)
+        return message
+
+    def test_schema_must_be_an_object(self):
+        for schema in ([], "columns", 3, None, True):
+            self.assert_structure_error(schema, "object")
+
+    def test_columns_must_be_a_non_empty_list(self):
+        self.assert_structure_error({}, "'columns'")
+        for columns in (None, "name", 3, {}, []):
+            self.assert_structure_error({"columns": columns}, "columns")
+
+    def test_column_must_be_an_object(self):
+        self.assert_structure_error({"columns": [None]}, "column 1", "None")
+        self.assert_structure_error(
+            {"columns": [{"name": "a", "type": "string"}, "x"]}, "column 2", "'x'")
+
+    def test_missing_name_and_type_name_the_field(self):
+        self.assert_structure_error({"columns": [{"type": "string"}]}, "column 1", "'name'")
+        self.assert_structure_error({"columns": [{"name": "a"}]}, "column 1", "'type'")
+
+    def test_name_must_be_a_non_blank_string(self):
+        self.assert_structure_error({"columns": [{"name": ["a"], "type": "string"}]},
+                                    "column 1", "name", "['a']")
+        self.assert_structure_error({"columns": [{"name": "", "type": "string"}]},
+                                  "column 1", "name")
+        self.assert_structure_error({"columns": [{"name": "   ", "type": "string"}]},
+                                    "column 1", "name")
+        self.assert_structure_error({"columns": [{"name": 3, "type": "string"}]},
+                                    "column 1", "name", "3")
+
+    def test_duplicate_name_points_at_the_later_column(self):
+        schema = {"columns": [
+            {"name": "a", "type": "string"},
+            {"name": "b", "type": "string"},
+            {"name": "a", "type": "integer"},
+        ]}
+        message = self.assert_structure_error(schema, "column 3", "'a'", "column 1")
+        self.assertNotIn("column 2", message)
+        # case-sensitive and never trimmed: these are all distinct names
+        ok = {"columns": [
+            {"name": "a", "type": "string"},
+            {"name": "A", "type": "string"},
+            {"name": " a ", "type": "string"},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = Path(directory) / "data.csv"
+            csv_path.write_text("a,A, a \nx,y,z\n", encoding="utf-8")
+            result = normalize_csv(csv_path, ok)
+        self.assertEqual(result["records"], [{"a": "x", "A": "y", " a ": "z"}])
+
+    def test_unknown_type_names_the_value(self):
+        self.assert_structure_error({"columns": [{"name": "a", "type": "date"}]},
+                                    "column 1", "type", "'date'")
+        self.assert_structure_error({"columns": [{"name": "a", "type": None}]},
+                                    "column 1", "type", "None")
+
+    def test_required_must_be_a_boolean_when_present(self):
+        self.assert_structure_error(
+            {"columns": [{"name": "a", "type": "string", "required": "yes"}]},
+            "column 1", "required", "'yes'")
+        self.assert_structure_error(
+            {"columns": [{"name": "a", "type": "string", "required": 1}]},
+            "column 1", "required", "1")
+
+    def test_only_the_first_error_is_reported(self):
+        # top-level beats every column problem
+        message = self.assert_structure_error({"columns": "x", "other": [None]}, "columns")
+        self.assertNotIn("column 1", message)
+        # an earlier column beats a later one
+        message = self.assert_structure_error(
+            {"columns": [{"name": "a", "type": "date"}, None]}, "column 1", "type")
+        self.assertNotIn("column 2", message)
+        # within a column: structure, name, duplicate, type, required order
+        message = self.assert_structure_error(
+            {"columns": [{"name": "a", "type": "string"},
+                         {"name": "a", "type": "date", "required": "x"}]},
+            "column 2", "duplicates")
+        self.assertNotIn("date", message)
+        message = self.assert_structure_error(
+            {"columns": [{"name": "a", "type": "date", "required": "x"}]},
+            "column 1", "type")
+        self.assertNotIn("required", message)
+
+    def test_schema_is_not_mutated(self):
+        import copy
+        schema = {"columns": [{"name": "a", "type": "string", "required": "yes",
+                               "unknown": 1}], "extra": True}
+        snapshot = copy.deepcopy(schema)
+        self.assert_structure_error(schema, "required")
+        self.assertEqual(schema, snapshot)
+
+    def test_valid_schema_with_unknown_attributes_still_works(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True, "odd": 1},
+            {"name": "orders", "type": "integer"},
+            {"name": "active", "type": "boolean", "required": False},
+        ], "unknown": "ignored"}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = Path(directory) / "data.csv"
+            csv_path.write_text("name,orders,active\nMaya,3,true\n", encoding="utf-8")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"name": "Maya", "orders": 3, "active": True}])
+
+    def run_cli_with_schema(self, directory, schema_text, source, fmt=None,
+                            extra=()):
+        schema_path = Path(directory) / "schema.json"
+        schema_path.write_text(schema_text, encoding="utf-8")
+        output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+        command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                   "--schema", str(schema_path),
+                   "--output", str(output), "--errors", str(errors)]
+        if fmt is not None:
+            command += ["--format", fmt]
+        command += list(extra)
+        return subprocess.run(command, capture_output=True, text=True), output, errors
+
+    def test_cli_structure_error_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = Path(directory) / "data.csv"
+            csv_path.write_text("name,orders,active\nMaya,3,true\n", encoding="utf-8")
+            jsonl_path = Path(directory) / "source.jsonl"
+            jsonl_path.write_text('{"name": "Maya", "orders": 3, "active": true}\n',
+                                  encoding="utf-8")
+            cases = [
+                ("{}", "'columns'"),
+                (json.dumps({"columns": None}), "columns"),
+                (json.dumps({"columns": [None]}), "column 1"),
+                (json.dumps({"columns": [{"type": "string"}]}), "'name'"),
+                (json.dumps({"columns": [{"name": ["a"], "type": "string"}]}), "name"),
+                (json.dumps({"columns": [{"name": "a", "type": "string"},
+                                         {"name": "a", "type": "string"}]}), "duplicates"),
+                (json.dumps({"columns": [{"name": "a", "type": "date"}]}), "'date'"),
+                (json.dumps({"columns": [{"name": "a", "type": "string",
+                                          "required": "yes"}]}), "required"),
+            ]
+            for fmt, source in ((None, csv_path), ("jsonl", jsonl_path)):
+                for schema_text, part in cases:
+                    with self.subTest(fmt=fmt, schema=schema_text):
+                        run, output, errors = self.run_cli_with_schema(
+                            directory, schema_text, source, fmt=fmt)
+                        self.assertEqual(run.returncode, 2, run.stderr)
+                        payload = json.loads(run.stdout)
+                        self.assertEqual(set(payload), {"error"})
+                        self.assertTrue(payload["error"].strip())
+                        self.assertIn("schema", payload["error"])
+                        self.assertIn(part, payload["error"])
+                        self.assertFalse(output.exists() or errors.exists())
+                        # a pre-existing output keeps its bytes
+                        output.write_bytes(b"keep me\n")
+                        run, output, errors = self.run_cli_with_schema(
+                            directory, schema_text, source, fmt=fmt)
+                        self.assertEqual(run.returncode, 2)
+                        self.assertEqual(output.read_bytes(), b"keep me\n")
+                        self.assertFalse(errors.exists())
+                        output.unlink()
+
+    def test_cli_structure_error_beats_missing_source(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            missing = Path(directory) / "does-not-exist.csv"
+            run, output, errors = self.run_cli_with_schema(directory, "{}", missing)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("schema", payload["error"])
+            self.assertFalse(output.exists() or errors.exists())
+
+    def test_cli_path_alias_precheck_still_runs_first(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = Path(directory) / "data.csv"
+            csv_path.write_text("name,orders,active\nMaya,3,true\n", encoding="utf-8")
+            # the schema is structurally invalid, but the alias conflict
+            # between the two outputs is reported instead
+            run, output, errors = self.run_cli_with_schema(
+                directory, "{}", csv_path,
+                extra=("--errors", str(csv_path)))
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("paths must be distinct", payload["error"])
+            self.assertNotIn("schema", payload["error"])
+
+
 class AtomicExportTests(unittest.TestCase):
     """The two CLI outputs commit together or not at all."""
 
