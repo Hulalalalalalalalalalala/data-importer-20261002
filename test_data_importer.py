@@ -25,6 +25,75 @@ class ImporterTests(unittest.TestCase):
         self.assertEqual([row["row"] for row in result["errors"]], [3, 4])
         self.assertIn("orders", result["errors"][0]["errors"][0])
 
+    def write_csv_bytes(self, directory, data):
+        path = Path(directory) / "data.csv"
+        path.write_bytes(data)
+        return path
+
+    def test_csv_physical_rows_blank_and_multiline_records(self):
+        # Blank physical lines and newlines inside quoted fields must not shift
+        # the reported row: it is the starting physical line, header is line 1.
+        text = "name,orders,active\n\n\"Ma\nya\",3,true\nBad,x,true\n\"No\nra\",2,\nZ,3,false\n"
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema, duplicate_by=["orders"])
+        self.assertEqual((result["accepted"], result["rejected"]), (2, 2))
+        self.assertEqual([row["row"] for row in result["errors"]], [5, 6])
+        self.assertEqual(result["errors"][0]["errors"], [
+            "orders: invalid literal for int() with base 10: 'x'"])
+        self.assertEqual(result["errors"][1]["errors"], ["active: required value is empty"])
+        # accepted records keep input order and the newline embedded in a name
+        self.assertEqual([record["name"] for record in result["records"]], ["Ma\nya", "Z"])
+        # duplicate report still numbers accepted records, not physical rows
+        self.assertEqual(result["duplicates"], [
+            {"key": {"orders": 3}, "record_numbers": [1, 2]}])
+
+    def test_csv_physical_rows_newline_variants_and_bom(self):
+        cases = [
+            (b"name,orders,active\r\n\r\n\"Ma\r\nya\",3,true\r\nBad,x,true\r\nZ,3,false\r\n",
+             [5], "CRLF"),
+            (b"name,orders,active\r\r\"Ma\rya\",3,true\rBad,x,true\rZ,3,false\r",
+             [5], "bare CR"),
+            (b"name,orders,active\n\"Ma\rya\",3,true\nBad,x,true\n\"No\rra\",2,\nZ,3,false\n",
+             [4, 5], "CR inside quoted field"),
+            (b"\xef\xbb\xbfname,orders,active\nMaya,3,true\nBad,x,true",
+             [3], "BOM and no trailing newline"),
+            (b"name,orders,active\nMaya,3,true\n\"No\nra\",2,",
+             [3], "multiline last record without trailing newline"),
+            (b"name,orders,active\n\n\nMaya,3,true\n\nBad,x,true\n\n",
+             [6], "consecutive and trailing blank lines"),
+        ]
+        for data, expected_rows, label in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                    csv_path = self.write_csv_bytes(directory, data)
+                    result = normalize_csv(csv_path, self.schema)
+                self.assertEqual([row["row"] for row in result["errors"]], expected_rows, label)
+                self.assertEqual(result["errors"][0]["row"], expected_rows[0])
+
+    def test_csv_multiline_wrong_cell_count_is_single_rejection(self):
+        # A record spanning several physical lines with the wrong number of
+        # cells is rejected once, at its starting physical line.
+        data = b"name,orders,active\n\"a\nb\",1\nMaya,3,true\n"
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv_bytes(directory, data)
+            result = normalize_csv(csv_path, self.schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (1, 1))
+        self.assertEqual(result["errors"][0]["row"], 2)
+        self.assertEqual(result["errors"][0]["errors"], ["wrong number of cells"])
+        self.assertEqual(result["records"][0]["name"], "Maya")
+
+    def test_csv_blank_lines_create_no_records_or_errors_and_are_deterministic(self):
+        data = b"name,orders,active\n\n\n   \nMaya,3,true\n\n"
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv_bytes(directory, data)
+            first = normalize_csv(csv_path, self.schema)
+            second = normalize_csv(csv_path, self.schema)
+        self.assertEqual(first, second)
+        self.assertEqual(first["accepted"], 1)
+        # the space-only line follows the ordinary CSV rule, empty lines do not
+        self.assertEqual([row["row"] for row in first["errors"]], [4])
+
     def test_invalid_schema_and_header(self):
         with self.assertRaises(ValueError):
             normalize_csv(ROOT / "samples/customers.csv", {"columns": [{"name": "name", "type": "date"}]})
@@ -135,6 +204,20 @@ class ImporterTests(unittest.TestCase):
             command[-1] = str(output)
             self.assertEqual(subprocess.run(command, capture_output=True).returncode, 2)
 
+
+    def test_cli_csv_error_jsonl_uses_physical_rows(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            text = "name,orders,active\n\n\"Ma\nya\",3,true\nBad,x,true\n\"No\nra\",2,\nZ,3,false\n"
+            csv_path = self.write_csv(directory, text)
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(csv_path),
+                       "--schema", str(ROOT / "samples/schema.json"),
+                       "--output", str(output), "--errors", str(errors)]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {"accepted": 2, "rejected": 2})
+            payload = [json.loads(line) for line in errors.read_text().splitlines()]
+            self.assertEqual([row["row"] for row in payload], [5, 6])
 
     def test_duplicate_report_groups_and_record_numbers(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:

@@ -69,23 +69,59 @@ def _find_duplicates(records, duplicate_by):
     ]
 
 
+class _PhysicalLines:
+    """Yield physical lines from handle while counting them.
+
+    Universal newline splitting stays active even with newline="", so LF,
+    CR and CRLF each end exactly one physical line (CRLF counts once).
+    """
+
+    def __init__(self, handle):
+        self._handle = handle
+        self.line = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        chunk = next(self._handle)
+        self.line += 1
+        return chunk
+
+
 def normalize_csv(source, schema, duplicate_by=None):
     columns, sources = _prepare_schema(schema)
     duplicate_fields = _prepare_duplicate_by(duplicate_by, [column["name"] for column in columns])
     records, errors = [], []
     with Path(source).open(encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames != sources:
+        lines = _PhysicalLines(handle)
+        reader = csv.reader(lines)
+        try:
+            header = next(reader)
+        except StopIteration:
+            header = None
+        if header != sources:
             raise ValueError("CSV header must match schema column sources and order exactly")
-        for row_number, row in enumerate(reader, start=2):
+        while True:
+            # The reader pulls exactly the physical lines of one record (newlines
+            # inside quoted fields included), so before next() line+1 is the
+            # physical line where the record starts.
+            row_number = lines.line + 1
+            try:
+                cells = next(reader)
+            except StopIteration:
+                break
+            if not cells:
+                # Blank physical lines are skipped but still consume a line number.
+                continue
             record = {}
             row_errors = []
-            if None in row or any(value is None for value in row.values()):
+            if len(cells) != len(sources):
                 row_errors.append("wrong number of cells")
             else:
-                for column, origin in zip(columns, sources):
+                for column, value in zip(columns, cells):
                     name, kind = column["name"], column["type"]
-                    value = row[origin].strip()
+                    value = value.strip()
                     try:
                         if not value:
                             if column.get("required", False):
