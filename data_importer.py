@@ -228,68 +228,116 @@ def _build_result(records, errors, duplicate_fields, filter_condition):
     return result
 
 
+def _csv_parse_error(source, start_line, reason):
+    """Build the ValueError for a fatal CSV quote-syntax failure.
+
+    The message carries the literal "CSV parse error", the input path, the
+    offending record's starting physical line (header is line 1; a data
+    record starts on the physical line after the preceding row ends), and
+    a reason distinguishing a quote left open at end of file from text
+    appearing right after a closing quote.
+    """
+    return ValueError(
+        f"CSV parse error in {source} at record starting line {start_line}: {reason}")
+
+
+def _csv_error_reason(exc):
+    """Map a strict-reader ``csv.Error`` onto the two fatal quote problems.
+
+    ``strict=True`` raises "unexpected end of data" for a quoted field
+    still open at EOF and "',' expected after '\"'" for any character
+    other than comma/newline/EOF right after a closing quote (spaces and
+    tabs included). Anything else is reported verbatim.
+    """
+    message = str(exc)
+    if message == "unexpected end of data":
+        return ("unterminated quoted field: a double-quoted field was still "
+                "open when the file ended")
+    if "expected after" in message:
+        return ("invalid text after closing quote: only a comma, a line "
+                "ending or the end of the file may follow a closing "
+                "double quote")
+    return message
+
+
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None):
     columns, sources, defaults, allowed = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
     records, errors = [], []
+    # strict=True turns the two quote-syntax problems that a lenient reader
+    # silently folds into the data into csv.Error: a quoted field still open
+    # at EOF and any character other than comma/newline/EOF right after a
+    # closing quote (a space or tab included). A doubled "" inside a quoted
+    # field still decodes to one literal double quote, and a double quote
+    # inside an unquoted field stays an ordinary character.
     with Path(source).open(encoding="utf-8-sig", newline="") as handle:
-        reader = csv.reader(handle)
-        try:
-            header = next(reader)
-        except StopIteration:
-            header = None
-        if header != sources:
-            raise ValueError("CSV header must match schema column sources and order exactly")
+        reader = csv.reader(handle, strict=True)
         # reader.line_num is the physical line where the row just read ends;
-        # LF, CRLF (counted once) and a lone CR all terminate a line. A record's
-        # starting physical line is one past the end of the preceding row, so
-        # skipped empty lines and newlines inside quoted fields shift it down.
-        previous_end = reader.line_num
-        for cells in reader:
-            start_line = previous_end + 1
-            previous_end = reader.line_num
-            if not cells:
-                # An ordinary empty physical line: skipped as a record but it
-                # still occupies a physical line number (tracked above).
-                continue
-            record = {}
-            row_errors = []
-            if len(cells) != len(sources):
-                row_errors.append("wrong number of cells")
-            else:
-                for column, value in zip(columns, cells):
-                    name, kind = column["name"], column["type"]
-                    value = value.strip()
-                    try:
-                        if not value:
-                            if name in defaults:
-                                converted = defaults[name]
-                            elif column.get("required", False):
-                                raise ValueError("required value is empty")
+        # LF, CRLF (counted once) and a lone CR all terminate a line. A
+        # record's starting physical line is one past the end of the
+        # preceding row, so skipped empty lines and newlines inside quoted
+        # fields shift it down. When the strict reader reports a syntax
+        # error the failing record starts on previous_end + 1, even though
+        # the problem is only detected at a later physical line or at EOF.
+        previous_end = 0
+        header = None
+        try:
+            for cells in reader:
+                start_line = previous_end + 1
+                previous_end = reader.line_num
+                if header is None:
+                    header = cells
+                    if header != sources:
+                        raise ValueError(
+                            "CSV header must match schema column sources and order exactly")
+                    continue
+                if not cells:
+                    # An ordinary empty physical line: skipped as a record but it
+                    # still occupies a physical line number (tracked above).
+                    continue
+                record = {}
+                row_errors = []
+                if len(cells) != len(sources):
+                    row_errors.append("wrong number of cells")
+                else:
+                    for column, value in zip(columns, cells):
+                        name, kind = column["name"], column["type"]
+                        value = value.strip()
+                        try:
+                            if not value:
+                                if name in defaults:
+                                    converted = defaults[name]
+                                elif column.get("required", False):
+                                    raise ValueError("required value is empty")
+                                else:
+                                    converted = None
+                            elif kind == "integer":
+                                converted = int(value)
+                            elif kind == "boolean":
+                                if value.casefold() not in ("true", "false"):
+                                    raise ValueError("boolean must be true or false")
+                                converted = value.casefold() == "true"
                             else:
-                                converted = None
-                        elif kind == "integer":
-                            converted = int(value)
-                        elif kind == "boolean":
-                            if value.casefold() not in ("true", "false"):
-                                raise ValueError("boolean must be true or false")
-                            converted = value.casefold() == "true"
+                                converted = value
+                        except ValueError as exc:
+                            row_errors.append(f"{name}: {exc}")
+                            continue
+                        enum_error = _enum_field_error(name, converted, allowed)
+                        if enum_error is not None:
+                            row_errors.append(enum_error)
                         else:
-                            converted = value
-                    except ValueError as exc:
-                        row_errors.append(f"{name}: {exc}")
-                        continue
-                    enum_error = _enum_field_error(name, converted, allowed)
-                    if enum_error is not None:
-                        row_errors.append(enum_error)
-                    else:
-                        record[name] = converted
-            if row_errors:
-                errors.append({"row": start_line, "errors": row_errors})
-            else:
-                records.append(record)
+                            record[name] = converted
+                if row_errors:
+                    errors.append({"row": start_line, "errors": row_errors})
+                else:
+                    records.append(record)
+        except csv.Error as exc:
+            raise _csv_parse_error(
+                source, previous_end + 1, _csv_error_reason(exc)) from None
+        if header is None:
+            raise ValueError("CSV header must match schema column sources and order exactly")
     return _build_result(records, errors, duplicate_fields, filter_condition)
 
 

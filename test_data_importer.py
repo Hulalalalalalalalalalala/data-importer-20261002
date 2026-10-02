@@ -801,6 +801,194 @@ class ImporterTests(unittest.TestCase):
             ])
 
 
+class CsvQuoteSyntaxTests(unittest.TestCase):
+    """A quoted field left open at EOF or junk after a closing quote is a
+    fatal parse error for the whole CSV, not silently folded into data."""
+
+    UNTERMINATED = "unterminated"
+    AFTER_CLOSE = "after closing quote"
+
+    def setUp(self):
+        self.schema = json.loads((ROOT / "samples/schema.json").read_text())
+
+    def write_csv(self, directory, text):
+        path = Path(directory) / "data.csv"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_csv_bytes(self, directory, data):
+        path = Path(directory) / "data.csv"
+        path.write_bytes(data)
+        return path
+
+    def assert_parse_failure(self, path, start_line, reason_part):
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(path, self.schema)
+        message = str(caught.exception)
+        self.assertIn("CSV parse error", message)
+        self.assertIn(str(path), message)
+        self.assertIn(f"record starting line {start_line}", message)
+        self.assertIn(reason_part, message)
+        return message
+
+    def test_unterminated_quoted_field_at_eof(self):
+        # The exact motivating input: the final quoted field never closes.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'name,orders,active\nMaya,3,"true')
+            message = self.assert_parse_failure(csv_path, 2, self.UNTERMINATED)
+            self.assertNotIn(self.AFTER_CLOSE, message)
+
+    def test_text_after_closing_quote_is_fatal(self):
+        # "Ma"ya must not collapse into the name; letters, spaces and tabs
+        # right after a closing quote are all illegal.
+        cases = (
+            ('name,orders,active\n"Ma"ya,3,true\n', 2),
+            ('name,orders,active\n"Ma" ya,3,true\n', 2),
+            ('name,orders,active\n"Ma"\tya,3,true\n', 2),
+            ('name,orders,active\nMaya,3,"true"x', 2),
+            ('name,orders,active\nMaya,3,"true" ,\n', 2),
+            ('name,orders,active\nMaya,3,true\n"x"y,2,false\n', 3),
+        )
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for text, line in cases:
+                csv_path = self.write_csv(directory, text)
+                message = self.assert_parse_failure(csv_path, line, self.AFTER_CLOSE)
+                self.assertNotIn(self.UNTERMINATED, message, text)
+
+    def test_error_line_points_to_multiline_record_start(self):
+        # Even though the problem is discovered on a later physical line
+        # (or at EOF), the message names where the record began. Blank
+        # lines and newlines inside quoted fields all occupy line numbers.
+        unterminated = ("name,orders,active\n"
+                        "Maya,3,true\n"
+                        "\n"
+                        '"a\nb",3,true\n'
+                        '"x\ny,3,true')
+        after_close = ("name,orders,active\n"
+                       "\n\n"
+                       '"a\nb",3,true\n'
+                       '"x\ny"z,3,true\n')
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, unterminated)
+            self.assert_parse_failure(csv_path, 6, self.UNTERMINATED)
+            csv_path = self.write_csv(directory, after_close)
+            self.assert_parse_failure(csv_path, 6, self.AFTER_CLOSE)
+
+    def test_quote_errors_after_valid_and_ordinary_error_rows(self):
+        # Earlier accepted records and ordinary row errors cannot make the
+        # later quote failure a row error: the call raises, returning
+        # nothing at all.
+        for text in ("name,orders,active\nMaya,3,true\nBad,x,true\n\"oops,3,true\n",
+                     "name,orders,active\nMaya,3,true\nBad,x,true\n\"Ma\"ya,3,true\n"):
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                csv_path = self.write_csv(directory, text)
+                self.assert_parse_failure(csv_path, 4, "quote")
+
+    def test_quote_errors_in_header_report_line_one(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'name,orders,"active')
+            self.assert_parse_failure(csv_path, 1, self.UNTERMINATED)
+            csv_path = self.write_csv(directory, 'name,orders,"active"x\nMaya,3,true\n')
+            self.assert_parse_failure(csv_path, 1, self.AFTER_CLOSE)
+
+    def test_valid_commas_newlines_and_doubled_quotes(self):
+        text = ('name,orders,active\n'
+                '"Ma,ya",3,true\n'
+                '"Ma""ya",2,true\n'
+                '"No\nra",4,false\n')
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (3, 0))
+        self.assertEqual([record["name"] for record in result["records"]],
+                         ["Ma,ya", 'Ma"ya', "No\nra"])
+
+    def test_valid_doubled_quote_and_eof_without_newline(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'name,orders,active\n"Ma""ya",3,true')
+            result = normalize_csv(csv_path, self.schema)
+        self.assertEqual(result["records"], [{"name": 'Ma"ya', "orders": 3, "active": True}])
+
+    def test_line_endings_bom_and_no_final_newline(self):
+        variants = (
+            b'name,orders,active\r\nMaya,3,"true',
+            b'name,orders,active\rMaya,3,"true',
+            b'\xef\xbb\xbfname,orders,active\nMaya,3,"true',
+            b'name,orders,active\r\n"Ma"ya,3,true\r\n',
+            b'name,orders,active\r"Ma"ya,3,true\r',
+        )
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for data in variants:
+                csv_path = self.write_csv_bytes(directory, data)
+                with self.assertRaises(ValueError) as caught:
+                    normalize_csv(csv_path, self.schema)
+                self.assertIn("CSV parse error", str(caught.exception), data)
+            # valid quoted multiline fields under every line convention,
+            # BOM and a missing final newline keep their old semantics:
+            # line bytes inside a quoted field are retained verbatim.
+            for data, expected_name in (
+                    (b'name,orders,active\r\n"Ma\r\nya",3,true\r\n', "Ma\r\nya"),
+                    (b'name,orders,active\r"Ma\rya",3,true\r', "Ma\rya"),
+                    (b'\xef\xbb\xbfname,orders,active\n"Maya",3,true\n', "Maya"),
+                    (b'name,orders,active\n"Maya",3,true', "Maya")):
+                csv_path = self.write_csv_bytes(directory, data)
+                result = normalize_csv(csv_path, self.schema)
+                self.assertEqual(result["accepted"], 1, data)
+                self.assertEqual(result["records"][0]["name"], expected_name, data)
+
+    def test_unquoted_double_quote_stays_literal(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'name,orders,active\nMa"ya,3,true\n')
+            result = normalize_csv(csv_path, self.schema)
+        self.assertEqual(result["records"], [{"name": 'Ma"ya', "orders": 3, "active": True}])
+
+    def test_cli_quote_errors_exit_two_and_keep_outputs(self):
+        bad_texts = {
+            "unterminated": "name,orders,active\nMaya,3,true\nBad,x,true\n\"oops,3,true\n",
+            "after": "name,orders,active\nMaya,3,true\nBad,x,true\n\"Ma\"ya,3,true\n",
+        }
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            for kind, text in bad_texts.items():
+                csv_path = self.write_csv(directory, text)
+                for fmt in (None, "csv"):
+                    output.write_bytes(b"previous output bytes\n")
+                    errors.write_bytes(b"previous error bytes\n")
+                    run = run_cli(csv_path, output, errors, fmt=fmt)
+                    self.assertEqual(run.returncode, 2, (kind, run.stderr))
+                    payload = json.loads(run.stdout)
+                    self.assertEqual(set(payload), {"error"})
+                    self.assertTrue(payload["error"].strip())
+                    self.assertIn("CSV parse error", payload["error"])
+                    self.assertIn(str(csv_path), payload["error"])
+                    self.assertIn("record starting line 4", payload["error"])
+                    self.assertIn(kind if kind == "unterminated" else self.AFTER_CLOSE,
+                                  payload["error"])
+                    self.assertEqual(output.read_bytes(), b"previous output bytes\n")
+                    self.assertEqual(errors.read_bytes(), b"previous error bytes\n")
+            # absent outputs stay absent and no success summary is printed
+            output.unlink()
+            errors.unlink()
+            run = run_cli(csv_path, output, errors)
+            self.assertEqual(run.returncode, 2)
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+            self.assertFalse(output.exists() or errors.exists())
+
+    def test_cli_quote_rules_apply_to_csv_format_only(self):
+        # The same characters as JSONL remain an ordinary per-line parse
+        # error: exit 1, other lines processed, both outputs written.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            jsonl_path = Path(directory) / "data.jsonl"
+            jsonl_path.write_text('{"name": "Maya", "orders": 3, "active": true}\n'
+                                  'Maya,3,"true\n', encoding="utf-8")
+            output, errors = Path(directory) / "out.jsonl", Path(directory) / "err.jsonl"
+            run = run_cli(jsonl_path, output, errors, fmt="jsonl")
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {"accepted": 1, "rejected": 1})
+            self.assertEqual(len(output.read_text().splitlines()), 1)
+            self.assertEqual(len(errors.read_text().splitlines()), 1)
+
+
 class JsonlImporterTests(unittest.TestCase):
     def setUp(self):
         self.schema = json.loads((ROOT / "samples/schema.json").read_text())
