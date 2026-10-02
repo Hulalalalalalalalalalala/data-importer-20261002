@@ -136,6 +136,105 @@ class ImporterTests(unittest.TestCase):
             self.assertEqual(subprocess.run(command, capture_output=True).returncode, 2)
 
 
+    def test_duplicate_report_groups_and_record_numbers(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,3,TRUE\n"
+                "b,3,true\n"
+                "bad,x,true\n"
+                "c,,true\n"
+                "d,,false\n")
+            result = normalize_csv(csv_path, self.schema, duplicate_by=["orders"])
+            self.assertEqual(len(result["records"]), 4)
+            self.assertEqual((result["accepted"], result["rejected"]), (4, 1))
+            self.assertEqual(result["duplicates"], [
+                {"key": {"orders": 3}, "record_numbers": [1, 2]},
+                {"key": {"orders": None}, "record_numbers": [3, 4]},
+            ])
+
+    def test_duplicate_report_disabled_or_absent(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\na,3,TRUE\nb,3,true\n")
+            self.assertNotIn("duplicates", normalize_csv(csv_path, self.schema))
+            self.assertNotIn("duplicates", normalize_csv(csv_path, self.schema, None))
+            unique = self.write_csv(directory, "name,orders,active\na,1,TRUE\nb,2,true\n")
+            self.assertEqual(normalize_csv(unique, self.schema, duplicate_by=["orders"])["duplicates"], [])
+
+    def test_duplicate_report_composite_and_first_seen_order(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,1,true\n"
+                "b,2,false\n"
+                "c,1,true\n"
+                "d,2,true\n"
+                "e,2,false\n")
+            result = normalize_csv(csv_path, self.schema, duplicate_by=["orders", "active"])
+            self.assertEqual(result["duplicates"], [
+                {"key": {"orders": 1, "active": True}, "record_numbers": [1, 3]},
+                {"key": {"orders": 2, "active": False}, "record_numbers": [2, 5]},
+            ])
+
+    def test_duplicate_by_invalid_config_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        cases = ["orders", [], ["orders", "orders"], [""], ["  "], [3], ("orders",),
+                 ["nope"], ["active", "nope"]]
+        for value in cases:
+            with self.assertRaises(ValueError):
+                normalize_csv(missing, self.schema, duplicate_by=value)
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, self.schema, duplicate_by=["orders", "nope"])
+        self.assertIn("nope", str(caught.exception))
+        # a source name is not accepted as a field name
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "display_name,purchase_count,active\nMaya,3,TRUE\n")
+            with self.assertRaises(ValueError):
+                normalize_csv(csv_path, self.mapped_schema(), duplicate_by=["purchase_count"])
+
+    def test_cli_duplicate_by_flag(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\nA,3,TRUE\nB,3,true\nC,,true\nBAD,x,true\nD,,true\n")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(csv_path),
+                       "--schema", str(ROOT / "samples/schema.json"),
+                       "--output", str(output), "--errors", str(errors),
+                       "--duplicate-by", "orders"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            summary = json.loads(run.stdout)
+            self.assertEqual(summary["accepted"], 4)
+            self.assertEqual(summary["rejected"], 1)
+            self.assertEqual(summary["duplicates"], [
+                {"key": {"orders": 3}, "record_numbers": [1, 2]},
+                {"key": {"orders": None}, "record_numbers": [3, 4]},
+            ])
+            self.assertEqual(len(output.read_text().splitlines()), 4)
+            self.assertEqual(len(errors.read_text().splitlines()), 1)
+
+    def test_cli_duplicate_by_bad_field_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\nA,3,TRUE\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(self.mapped_schema()), encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(csv_path),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--duplicate-by", "purchase_count"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            payload = json.loads(run.stdout)
+            self.assertIn("error", payload)
+            self.assertIn("purchase_count", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+
 class JsonlImporterTests(unittest.TestCase):
     def setUp(self):
         self.schema = json.loads((ROOT / "samples/schema.json").read_text())
@@ -353,6 +452,63 @@ class JsonlImporterTests(unittest.TestCase):
             self.assertIn("error", json.loads(run.stdout))
             self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
             self.assertFalse(errors.exists())
+
+
+    def test_duplicate_report_jsonl_values_and_blank_lines(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": 3, "active": true}\n'
+                '{"name": "b", "orders": " 3 ", "active": true}\n'
+                '\n'
+                'not json\n'
+                '{"name": "c", "orders": null, "active": true}\n'
+                '{"name": "d", "orders": null, "active": false}\n')
+            result = normalize_jsonl(path, self.schema, duplicate_by=["orders"])
+            self.assertEqual((result["accepted"], result["rejected"]), (4, 1))
+            self.assertEqual(len(result["records"]), 4)
+            self.assertEqual(result["duplicates"], [
+                {"key": {"orders": 3}, "record_numbers": [1, 2]},
+                {"key": {"orders": None}, "record_numbers": [3, 4]},
+            ])
+
+    def test_duplicate_report_string_case_sensitive_and_validation(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "X", "orders": 1, "active": true}\n'
+                '{"name": "x", "orders": 2, "active": true}\n')
+            self.assertEqual(normalize_jsonl(path, self.schema, duplicate_by=["name"])["duplicates"], [])
+            missing = ROOT / "samples" / "does-not-exist.jsonl"
+            for value in ("name", [], ["name", "name"], [""], ["  "], [3], ["nope"]):
+                with self.assertRaises(ValueError):
+                    normalize_jsonl(missing, self.schema, duplicate_by=value)
+            self.assertNotIn("duplicates", normalize_jsonl(path, self.schema))
+
+    def test_cli_jsonl_duplicate_by_flag(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": 3, "active": true}\n'
+                '{"name": "b", "orders": "3", "active": true}\n'
+                '{"name": "c", "orders": null, "active": true}\n'
+                '{"name": "d", "orders": null, "active": true}\n',
+                name="source.jsonl")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(path),
+                       "--schema", str(ROOT / "samples/schema.json"),
+                       "--output", str(output), "--errors", str(errors), "--format", "jsonl",
+                       "--duplicate-by", "orders"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout), {
+                "accepted": 4, "rejected": 0,
+                "duplicates": [
+                    {"key": {"orders": 3}, "record_numbers": [1, 2]},
+                    {"key": {"orders": None}, "record_numbers": [3, 4]},
+                ]})
+            self.assertEqual(len(output.read_text().splitlines()), 4)
+            self.assertEqual(errors.read_text(encoding="utf-8"), "")
 
 
 if __name__ == "__main__":
