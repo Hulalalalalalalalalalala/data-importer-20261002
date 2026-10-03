@@ -4299,5 +4299,247 @@ class UnicodeNormalizationTests(unittest.TestCase):
                 self.assertEqual(records, self.expected_records())
 
 
+class PatternTests(unittest.TestCase):
+    """Optional full-string ``pattern`` validation for ``string`` columns."""
+
+    FULLWIDTH_CODE = "ＡＢ１２"
+    PATTERN = "[A-Z]{2}[0-9]{2}"
+
+    def schema(self, **overrides):
+        column = {"name": "code", "type": "string",
+                  "unicode_normalization": "NFKC",
+                  "pattern": self.PATTERN,
+                  "default": self.FULLWIDTH_CODE}
+        column.update(overrides)
+        return {"columns": [column]}
+
+    def write_csv(self, directory, text):
+        path = Path(directory) / "data.csv"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_jsonl(self, directory, values, key="code"):
+        path = Path(directory) / "data.jsonl"
+        path.write_text("".join(json.dumps({key: value}, ensure_ascii=False) + "\n"
+                                for value in values), encoding="utf-8")
+        return path
+
+    def write_sample_pair(self, directory):
+        csv_path = self.write_csv(
+            directory, "code\n " + self.FULLWIDTH_CODE + " \nAB12\n\"\"\nab12\nXAB12Y\n")
+        jsonl_path = self.write_jsonl(
+            directory, [" " + self.FULLWIDTH_CODE + " ", "AB12", None, "ab12", "XAB12Y"])
+        return ((normalize_csv, csv_path, 6), (normalize_jsonl, jsonl_path, 5))
+
+    def test_fixed_sample_csv_and_jsonl(self):
+        # Padded full-width ＡＢ１２, plain AB12, the empty value (filled with
+        # the normalized full-width default), lowercase ab12 and padded
+        # XAB12Y: three identical AB12 records survive, the last two rows
+        # are rejected, and both formats agree.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for normalize, path, last_row in self.write_sample_pair(directory):
+                result = normalize(path, self.schema())
+                self.assertEqual(result["records"],
+                                 [{"code": "AB12"}, {"code": "AB12"}, {"code": "AB12"}])
+                self.assertEqual((result["accepted"], result["rejected"]), (3, 2))
+                self.assertEqual([row["row"] for row in result["errors"]],
+                                 [last_row - 1, last_row])
+                for row, text in zip(result["errors"], ("ab12", "XAB12Y")):
+                    self.assertEqual(len(row["errors"]), 1)
+                    message = row["errors"][0]
+                    self.assertIn("pattern", message)
+                    self.assertIn("code", message)
+                    self.assertIn(repr(text), message)
+                    self.assertIn(self.PATTERN, message)
+
+    def test_pattern_precedes_filter_and_dedup_uses_valid_records(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for normalize, path, _ in self.write_sample_pair(directory):
+                filtered = normalize(
+                    path, self.schema(), filter_eq={"field": "code", "value": "AB12"})
+                self.assertEqual((filtered["accepted"], filtered["filtered"],
+                                  filtered["rejected"]), (3, 0, 2))
+                deduped = normalize(path, self.schema(), deduplicate_by=["code"])
+                self.assertEqual(deduped["records"], [{"code": "AB12"}])
+                self.assertEqual(deduped["deduplicated"], 2)
+                reported = normalize(path, self.schema(), duplicate_by=["code"])
+                self.assertEqual(reported["duplicates"], [
+                    {"key": {"code": "AB12"}, "record_numbers": [1, 2, 3]}])
+
+    def test_match_is_case_sensitive_unless_inline_flags_say_otherwise(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nab12\nAB12\n")
+            strict = self.schema(pattern=self.PATTERN, default="AB12")
+            result = normalize_csv(csv_path, strict)
+            self.assertEqual([r["code"] for r in result["records"]], ["AB12"])
+            self.assertEqual(result["rejected"], 1)
+            relaxed = self.schema(pattern="(?i)[a-z]{2}[0-9]{2}", default="AB12")
+            result = normalize_csv(csv_path, relaxed)
+            self.assertEqual([r["code"] for r in result["records"]], ["ab12", "AB12"])
+            self.assertEqual(result["rejected"], 0)
+
+    def test_optional_null_and_required_empty_ignore_pattern(self):
+        optional = {"columns": [{"name": "code", "type": "string",
+                                 "pattern": self.PATTERN}]}
+        required = {"columns": [{"name": "code", "type": "string", "required": True,
+                                 "pattern": self.PATTERN}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'code\n""\n')
+            jsonl_path = self.write_jsonl(directory, [None])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                self.assertEqual(normalize(path, optional)["records"], [{"code": None}])
+                result = normalize(path, required)
+                self.assertEqual(result["rejected"], 1)
+                self.assertEqual(result["errors"][0]["errors"],
+                                 ["code: required value is empty"])
+
+    def test_enum_and_type_failures_keep_only_their_error(self):
+        schema = self.schema(allowed_values=["AB12", "xy"])
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nzz\nxy\n")
+            result = normalize_csv(csv_path, schema)
+            self.assertEqual(result["rejected"], 2)
+            self.assertIn("allowed_values", result["errors"][0]["errors"][0])
+            self.assertNotIn("pattern", result["errors"][0]["errors"][0])
+            # an enum member that fails the pattern still fails the pattern
+            self.assertIn("pattern", result["errors"][1]["errors"][0])
+            jsonl_path = Path(directory) / "data.jsonl"
+            jsonl_path.write_text('{"code": 4}\n', encoding="utf-8")
+            result = normalize_jsonl(jsonl_path, schema)
+            self.assertEqual(result["errors"][0]["errors"], ["code: expected string"])
+
+    def test_allowed_values_entries_not_matching_are_not_a_config_error(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [{"name": "code", "type": "string",
+                               "pattern": self.PATTERN,
+                               "allowed_values": ["AB12", "nope"]}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nAB12\n")
+            self.assertEqual(normalize_csv(csv_path, schema)["accepted"], 1)
+        # the same schema would raise before reading if entries were checked
+        self.assertEqual(schema["columns"][0]["allowed_values"], ["AB12", "nope"])
+
+    def test_multi_field_errors_collected_in_schema_order(self):
+        schema = {"columns": [
+            {"name": "a", "type": "string", "pattern": "[0-9]+"},
+            {"name": "b", "type": "string", "pattern": "[A-Z]+"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "a,b\nx,1\n")
+            jsonl_path = Path(directory) / "data.jsonl"
+            jsonl_path.write_text('{"a": "x", "b": "1"}\n', encoding="utf-8")
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                result = normalize(path, schema)
+                self.assertEqual(result["rejected"], 1)
+                errors = result["errors"][0]["errors"]
+                self.assertEqual(len(errors), 2)
+                self.assertTrue(errors[0].startswith("a:"), errors)
+                self.assertTrue(errors[1].startswith("b:"), errors)
+
+    def test_invalid_pattern_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        for value in (3, True, None, ["x"], "", "   ", "[A-Z", "(", "*x"):
+            schema = {"columns": [{"name": "code", "type": "string",
+                                   "pattern": value}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("pattern", message, value)
+                self.assertIn("code", message, value)
+                self.assertIn(repr(value), message, value)
+        for kind in ("integer", "boolean"):
+            schema = {"columns": [{"name": "code", "type": kind,
+                                   "pattern": self.PATTERN}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("pattern", message)
+                self.assertIn("code", message)
+                self.assertIn(repr(self.PATTERN), message)
+
+    def test_default_not_matching_is_a_config_error(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        # the default is trimmed and NFKC-normalized first: full-width ＡＢ１
+        # processes to AB1, which the pattern refuses even though no row
+        # would ever need the default
+        schema = self.schema(default="ＡＢ１")
+        for normalize in (normalize_csv, normalize_jsonl):
+            with self.assertRaises(ValueError) as caught:
+                normalize(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("default", message)
+            self.assertIn("pattern", message)
+            self.assertIn("code", message)
+            self.assertIn(self.PATTERN, message)
+
+    def test_structure_check_still_runs_first(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [{"name": "code", "type": "date",
+                               "pattern": self.PATTERN}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertIn("schema", str(caught.exception))
+        self.assertNotIn("pattern", str(caught.exception))
+
+    def test_schema_dict_is_never_mutated(self):
+        import copy
+        schema = self.schema()
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nAB12\n")
+            normalize_csv(csv_path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_cli_row_errors_exit_one_and_export(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(self.schema(), ensure_ascii=False),
+                                   encoding="utf-8")
+            pair = self.write_sample_pair(directory)
+            for fmt, source in (("csv", pair[0][1]), ("jsonl", pair[1][1])):
+                output = Path(directory) / f"out-{fmt}.jsonl"
+                errors = Path(directory) / f"err-{fmt}.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"),
+                           str(source), "--schema", str(schema_path),
+                           "--output", str(output), "--errors", str(errors),
+                           "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                summary = json.loads(run.stdout)
+                self.assertEqual((summary["accepted"], summary["rejected"]), (3, 2))
+                records = [json.loads(line)
+                           for line in output.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(records, [{"code": "AB12"}] * 3)
+                error_rows = [json.loads(line)
+                              for line in errors.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(error_rows), 2)
+                self.assertIn("pattern", error_rows[0]["errors"][0])
+
+    def test_cli_bad_pattern_exit_two_keeps_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_csv(directory, "code\nAB12\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(
+                {"columns": [{"name": "code", "type": "string",
+                              "pattern": "[A-Z{"}]}), encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("pattern", payload["error"])
+            self.assertIn("code", payload["error"])
+            self.assertIn("[A-Z{", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
