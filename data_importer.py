@@ -4,6 +4,7 @@ import contextlib
 import csv
 import json
 import os
+import re
 import tempfile
 import unicodedata
 from pathlib import Path
@@ -138,6 +139,67 @@ def _prepare_allowed_values(columns, defaults):
                 f"column {name!r} default {defaults[name]!r} is not one of "
                 f"allowed_values {checked!r}")
     return allowed
+
+
+def _prepare_patterns(columns, defaults):
+    """Validate the optional ``pattern`` regular expression of each column.
+
+    Returns a mapping of output field name to a ``(pattern, compiled)``
+    pair, the declared expression kept verbatim next to its compiled form.
+    The attribute may appear only on ``string`` columns and must be a
+    non-blank string that compiles under Python's standard ``re`` module:
+    a non-string or blank value, a declaration on an ``integer`` or
+    ``boolean`` column, and an expression with a syntax error are
+    configuration errors. Matching later covers the whole final string
+    (``re.fullmatch`` semantics), case-sensitively by default, with inline
+    flags such as ``(?i)`` honored; a passing match never alters the text.
+    A processed default (already trimmed and NFKC-normalized when opted
+    in) that does not match is a configuration error even when no row
+    needs it; ``allowed_values`` entries are never checked against the
+    pattern. Raises ValueError naming ``pattern``, the output field and
+    the offending value before the input is read; the caller's schema is
+    never mutated.
+    """
+    patterns = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "pattern" not in column:
+            continue
+        pattern = column["pattern"]
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError(
+                f"column {name!r} pattern {pattern!r} must be a non-blank string")
+        if kind != "string":
+            raise ValueError(
+                f"column {name!r} pattern {pattern!r} requires a string column")
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"column {name!r} pattern {pattern!r} is not a valid regular "
+                f"expression: {exc}") from None
+        patterns[name] = (pattern, compiled)
+        if name in defaults and compiled.fullmatch(defaults[name]) is None:
+            raise ValueError(
+                f"column {name!r} default {defaults[name]!r} does not match "
+                f"pattern {pattern!r}")
+    return patterns
+
+
+def _pattern_field_error(name, value, patterns):
+    """Return the pattern error for a converted value, or None when it matches.
+
+    Null is never checked: an empty optional without a default stays null
+    and the full-string match only sees non-null strings, after type
+    conversion, empty handling and the enum check.
+    """
+    entry = patterns.get(name)
+    if entry is None or value is None:
+        return None
+    pattern, compiled = entry
+    if compiled.fullmatch(value) is None:
+        return f"{name}: value {value!r} does not match pattern {pattern!r}"
+    return None
 
 
 def _prepare_ranges(columns, defaults):
@@ -422,6 +484,7 @@ def _prepare_schema(schema):
     normalizing = _prepare_unicode_normalization(columns)
     defaults = _prepare_defaults(columns, normalizing)
     allowed = _prepare_allowed_values(columns, defaults)
+    patterns = _prepare_patterns(columns, defaults)
     markers = _prepare_missing_values(columns)
     aliases = _prepare_boolean_aliases(columns)
     ranges = _prepare_ranges(columns, defaults)
@@ -442,7 +505,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns
 
 
 def _prepare_field_list(fields, names, option):
@@ -653,7 +716,7 @@ def _nfkc(value):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -758,6 +821,11 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                         if range_error is not None:
                             slots[index].append(range_error)
                             field_error_names.add(name)
+                            continue
+                        pattern_error = _pattern_field_error(name, converted, patterns)
+                        if pattern_error is not None:
+                            slots[index].append(pattern_error)
+                            field_error_names.add(name)
                         else:
                             record[name] = converted
                     for name, message in _lte_field_errors(
@@ -835,7 +903,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -907,6 +975,11 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                 range_error = _range_field_error(name, converted, ranges)
                 if range_error is not None:
                     slots[index].append(range_error)
+                    field_error_names.add(name)
+                    continue
+                pattern_error = _pattern_field_error(name, converted, patterns)
+                if pattern_error is not None:
+                    slots[index].append(pattern_error)
                     field_error_names.add(name)
                 else:
                     record[name] = converted
