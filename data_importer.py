@@ -38,17 +38,47 @@ def _prepare_unicode_normalization(columns):
     return normalizing
 
 
-def _prepare_defaults(columns, normalizing=frozenset()):
+def _prepare_casefold(columns):
+    """Validate the optional per-column ``casefold`` attribute.
+
+    Returns the set of output field names that opt in. The attribute may
+    appear only on ``string`` columns and its value must be a boolean:
+    ``true`` enables Unicode case folding (Python ``str.casefold()``) of
+    the final string, ``false`` keeps the previous behavior, and a
+    non-boolean value or a declaration on an ``integer`` or ``boolean``
+    column is a configuration error. Raises ValueError naming
+    ``casefold``, the output field and the offending value before the
+    input is read; the caller's schema is never mutated.
+    """
+    folding = set()
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "casefold" not in column:
+            continue
+        enabled = column["casefold"]
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                f"column {name!r} casefold {enabled!r} must be a boolean")
+        if kind != "string":
+            raise ValueError(
+                f"column {name!r} casefold {enabled!r} requires a string column")
+        if enabled:
+            folding.add(name)
+    return folding
+
+
+def _prepare_defaults(columns, normalizing=frozenset(), casefolding=frozenset()):
     """Validate the optional target-typed ``default`` of each column.
 
     Returns a mapping of output field name to the processed default
     (string defaults are trimmed; a string column opting into NFKC also
-    has its default NFKC-normalized and re-trimmed). A malformed default
-    is a configuration error naming the default value and output field,
-    raised before the input is read; the caller's schema dicts are never
-    mutated. A normalized string default that becomes blank is refused
-    here so the later ``allowed_values`` membership check keeps using
-    the final emitted text.
+    has its default NFKC-normalized and re-trimmed, and a string column
+    opting into case folding then has it casefolded, in that order). A
+    malformed default is a configuration error naming the default value
+    and output field, raised before the input is read; the caller's
+    schema dicts are never mutated. A normalized string default that
+    becomes blank is refused here so the later ``allowed_values``
+    membership check keeps using the final emitted text.
     """
     defaults = {}
     for column in columns:
@@ -67,6 +97,10 @@ def _prepare_defaults(columns, normalizing=frozenset()):
                 if not processed:
                     raise ValueError(
                         f"column {name!r} default {default!r} must not normalize to blank")
+            if name in casefolding:
+                # Case folding never blanks a non-blank string, so the
+                # folded default needs no further emptiness check.
+                processed = processed.casefold()
             defaults[name] = processed
         elif kind == "integer":
             if isinstance(default, bool) or not isinstance(default, int):
@@ -487,7 +521,8 @@ def _prepare_schema(schema):
     _validate_schema_structure(schema)
     columns = schema["columns"]
     normalizing = _prepare_unicode_normalization(columns)
-    defaults = _prepare_defaults(columns, normalizing)
+    casefolding = _prepare_casefold(columns)
+    defaults = _prepare_defaults(columns, normalizing, casefolding)
     allowed = _prepare_allowed_values(columns, defaults)
     markers = _prepare_missing_values(columns)
     aliases = _prepare_boolean_aliases(columns)
@@ -510,7 +545,7 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding
 
 
 def _prepare_field_list(fields, names, option):
@@ -721,7 +756,7 @@ def _nfkc(value):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -813,6 +848,13 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                                             raise ValueError("required value is empty")
                                         else:
                                             converted = None
+                                if isinstance(converted, str) and name in casefolding:
+                                    # Case folding runs last, on the final
+                                    # string (a filled default was already
+                                    # folded at load; folding it again is
+                                    # idempotent), before the enum, range
+                                    # and pattern checks.
+                                    converted = converted.casefold()
                         except ValueError as exc:
                             slots[index].append(f"{name}: {exc}")
                             field_error_names.add(name)
@@ -851,7 +893,7 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
 
 
 def _convert_jsonl_value(column, value, defaults, markers, aliases,
-                         normalizing=frozenset()):
+                         normalizing=frozenset(), casefolding=frozenset()):
     """Convert one decoded JSON value. Returns (converted, error_message)."""
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
@@ -882,6 +924,10 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
                     return None, f"{name}: required value is empty"
                 return None, None
             value = normalized
+        if name in casefolding:
+            # Case folding runs last, on the final string, before the
+            # enum, range and pattern checks.
+            value = value.casefold()
         return value, None
     if kind == "integer":
         if isinstance(value, bool):
@@ -908,7 +954,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -967,7 +1013,8 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
             for index, (column, origin) in enumerate(zip(columns, sources)):
                 name = column["name"]
                 converted, message = _convert_jsonl_value(
-                    column, obj[origin], defaults, markers, aliases, normalizing)
+                    column, obj[origin], defaults, markers, aliases, normalizing,
+                    casefolding)
                 if message is not None:
                     slots[index].append(message)
                     field_error_names.add(name)
