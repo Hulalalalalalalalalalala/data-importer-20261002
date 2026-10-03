@@ -3239,6 +3239,291 @@ class LteFieldRelationTests(unittest.TestCase):
                 self.assertFalse(errors.exists())
 
 
+class RequiredWhenTests(unittest.TestCase):
+    """Any column may declare required_when naming a boolean output
+    column; when the condition's final boolean is true the declaring
+    column's final value must not be null."""
+
+    def sample_schema(self, **email_overrides):
+        email = {"name": "email", "type": "string", "required_when": "active"}
+        email.update(email_overrides)
+        return {"columns": [{"name": "active", "type": "boolean"}, email]}
+
+    def write_source(self, directory, text, fmt):
+        path = Path(directory) / ("data.csv" if fmt == "csv" else "data.jsonl")
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def normalize(self, path, schema, fmt, **kwargs):
+        return (normalize_csv if fmt == "csv" else normalize_jsonl)(path, schema, **kwargs)
+
+    ROWS = {
+        "csv": "active,email\ntrue,\nfalse,\n,\ntrue, a \n",
+        "jsonl": ('{"active": true, "email": null}\n'
+                  '{"active": false, "email": null}\n'
+                  '{"active": null, "email": null}\n'
+                  '{"active": true, "email": " a "}\n'),
+    }
+
+    def test_fixed_sample_both_formats(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.ROWS[fmt], fmt)
+                result = self.normalize(path, self.sample_schema(), fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (3, 1), fmt)
+            self.assertEqual([record["email"] for record in result["records"]],
+                             [None, None, "a"])
+            self.assertEqual([row["row"] for row in result["errors"]],
+                             [2] if fmt == "csv" else [1])
+            message = result["errors"][0]["errors"][0]
+            self.assertIn("required_when", message)
+            self.assertIn("email", message)
+            self.assertIn("active", message)
+            self.assertIn("true", message)
+
+    def test_false_and_null_conditions_never_fire(self):
+        for fmt, text in (("csv", "active,email\nfalse,\n,\n"),
+                          ("jsonl", '{"active": false, "email": null}\n'
+                                    '{"active": null, "email": null}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, self.sample_schema(), fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (2, 0), fmt)
+            self.assertEqual(result["errors"], [])
+
+    def test_zero_and_false_count_as_values(self):
+        schema = {"columns": [
+            {"name": "active", "type": "boolean"},
+            {"name": "count", "type": "integer", "required_when": "active"},
+            {"name": "flag", "type": "boolean", "required_when": "active"},
+        ]}
+        for fmt, text in (("csv", "active,count,flag\ntrue,0,false\n"),
+                          ("jsonl", '{"active": true, "count": 0, "flag": false}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (1, 0), fmt)
+            self.assertEqual(result["records"],
+                             [{"active": True, "count": 0, "flag": False}])
+
+    def test_condition_column_may_follow_the_declaring_column(self):
+        schema = {"columns": [
+            {"name": "email", "type": "string", "required_when": "active"},
+            {"name": "active", "type": "boolean"},
+        ]}
+        for fmt, text in (("csv", "email,active\n,true\nx,false\n"),
+                          ("jsonl", '{"email": null, "active": true}\n'
+                                    '{"email": "x", "active": false}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (1, 1), fmt)
+            self.assertEqual(result["records"], [{"email": "x", "active": False}])
+
+    def test_filled_default_and_boolean_alias_participate(self):
+        # A default standing in for the declaring column satisfies the
+        # rule; a condition converted through a boolean alias fires it.
+        schema = {"columns": [
+            {"name": "active", "type": "boolean",
+             "boolean_aliases": {"YES": True}},
+            {"name": "email", "type": "string", "default": "none",
+             "required_when": "active"},
+        ]}
+        for fmt, text in (("csv", "active,email\nyes,\nyes, x \n"),
+                          ("jsonl", '{"active": "yes", "email": null}\n'
+                                    '{"active": "YES", "email": " x "}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (2, 0), fmt)
+            self.assertEqual([record["email"] for record in result["records"]],
+                             ["none", "x"])
+        # A boolean default of true on the condition column fires the rule.
+        schema = {"columns": [
+            {"name": "active", "type": "boolean", "default": True},
+            {"name": "email", "type": "string", "required_when": "active"},
+        ]}
+        for fmt, text in (("csv", "active,email\n,\n"),
+                          ("jsonl", '{"active": null, "email": null}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (0, 1), fmt)
+            self.assertIn("required_when", result["errors"][0]["errors"][0])
+
+    def test_required_still_applies_unconditionally(self):
+        schema = self.sample_schema(required=True)
+        for fmt, text in (("csv", "active,email\nfalse,\n"),
+                          ("jsonl", '{"active": false, "email": null}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (0, 1), fmt)
+            self.assertEqual(result["errors"][0]["errors"],
+                             ["email: required value is empty"])
+
+    def test_participant_field_error_skips_the_rule(self):
+        schema = {"columns": [
+            {"name": "active", "type": "boolean"},
+            {"name": "email", "type": "string", "required_when": "active"},
+            {"name": "count", "type": "integer", "required_when": "active"},
+        ]}
+        # Row 1: the condition column has a type error, so both rules are
+        # skipped and only the original error is kept. Row 2: count has a
+        # type error, so its rule is skipped, but the email rule on the
+        # same row is still checked and fires.
+        for fmt, text in (("csv", "active,email,count\nmaybe,,\ntrue,,bad\n"),
+                          ("jsonl", '{"active": "maybe", "email": null, "count": null}\n'
+                                    '{"active": true, "email": null, "count": "bad"}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual((result["accepted"], result["rejected"]), (0, 2), fmt)
+            first, second = result["errors"]
+            self.assertEqual(len(first["errors"]), 1)
+            self.assertNotIn("required_when", first["errors"][0])
+            self.assertEqual(len(second["errors"]), 2)
+            self.assertIn("required_when", second["errors"][0])
+            self.assertNotIn("required_when", second["errors"][1])
+
+    def test_errors_filed_in_schema_column_order(self):
+        schema = {"columns": [
+            {"name": "active", "type": "boolean"},
+            {"name": "email", "type": "string", "required_when": "active"},
+            {"name": "count", "type": "integer", "required_when": "active"},
+        ]}
+        for fmt, text in (("csv", "active,email,count\ntrue,,\n"),
+                          ("jsonl", '{"active": true, "email": null, "count": null}\n')):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, text, fmt)
+                result = self.normalize(path, schema, fmt)
+            self.assertEqual(result["errors"][0]["errors"], [
+                "email: value is null but required_when 'active' is true",
+                "count: value is null but required_when 'active' is true",
+            ])
+
+    def test_rule_precedes_filtering(self):
+        # A violating row is rejected even when the filter would match it.
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                path = self.write_source(directory, self.ROWS[fmt], fmt)
+                result = self.normalize(
+                    path, self.sample_schema(), fmt,
+                    filter_eq={"field": "active", "value": True})
+            self.assertEqual((result["accepted"], result["filtered"],
+                              result["rejected"]), (1, 2, 1), fmt)
+            self.assertEqual(result["records"], [{"active": True, "email": "a"}])
+
+    def test_invalid_required_when_config_raises_before_reading(self):
+        import copy
+        missing = {"csv": ROOT / "samples" / "does-not-exist.csv",
+                   "jsonl": ROOT / "samples" / "does-not-exist.jsonl"}
+        bad_columns = [
+            {"name": "email", "type": "string", "required_when": 3},
+            {"name": "email", "type": "string", "required_when": True},
+            {"name": "email", "type": "string", "required_when": None},
+            {"name": "email", "type": "string", "required_when": ["active"]},
+            {"name": "email", "type": "string", "required_when": ""},
+            {"name": "email", "type": "string", "required_when": "   "},
+            {"name": "email", "type": "string", "required_when": "nope"},
+            {"name": "email", "type": "string", "required_when": "email"},
+            {"name": "email", "type": "string", "required_when": "Active"},
+            {"name": "email", "type": "string", "required_when": " active"},
+            {"name": "email", "type": "string", "required_when": "count"},
+            {"name": "email", "type": "integer", "required_when": "count"},
+            {"name": "email", "type": "boolean", "required_when": "count"},
+        ]
+        for fmt in ("csv", "jsonl"):
+            normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+            for column in bad_columns:
+                schema = {"columns": [
+                    {"name": "active", "type": "boolean"},
+                    {"name": "count", "type": "integer"},
+                    column,
+                ]}
+                with self.subTest(fmt=fmt, column=column):
+                    snapshot = copy.deepcopy(schema)
+                    with self.assertRaises(ValueError) as caught:
+                        normalize(missing[fmt], schema)
+                    message = str(caught.exception)
+                    self.assertIn("required_when", message)
+                    self.assertIn(column["name"], message)
+                    self.assertIn(repr(column["required_when"]), message)
+                    self.assertEqual(schema, snapshot)
+
+    def test_source_alias_is_not_a_required_when_target(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [
+            {"name": "active", "type": "boolean", "source": "flag"},
+            {"name": "email", "type": "string", "required_when": "flag"},
+        ]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertIn("required_when", str(caught.exception))
+        # the output name is accepted and processing reaches file open
+        schema["columns"][1]["required_when"] = "active"
+        with self.assertRaises(OSError):
+            normalize_csv(missing, schema)
+
+    def test_structure_check_still_runs_first(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [
+            {"name": "email", "type": "date", "required_when": 3},
+        ]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertNotIn("required_when", str(caught.exception))
+
+    def test_cli_row_errors_exit_one_and_export(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = self.write_source(directory, self.ROWS[fmt], fmt)
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps(self.sample_schema()), encoding="utf-8")
+                output, errors = Path(directory) / "records.jsonl", Path(directory) / "errors.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(json.loads(run.stdout), {"accepted": 3, "rejected": 1})
+                records = [json.loads(line) for line in output.read_text().splitlines()]
+                self.assertEqual([record["email"] for record in records],
+                                 [None, None, "a"])
+                error_rows = [json.loads(line) for line in errors.read_text().splitlines()]
+                self.assertEqual(len(error_rows), 1)
+                self.assertIn("required_when", error_rows[0]["errors"][0])
+                self.assertEqual(hidden_entries(directory), [])
+
+    def test_cli_bad_required_when_exit_two_keeps_files(self):
+        for fmt in ("csv", "jsonl"):
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                source = Path(directory) / f"source.{fmt}"
+                source.write_text(
+                    "active,email\ntrue,x\n" if fmt == "csv"
+                    else '{"active": true, "email": "x"}\n', encoding="utf-8")
+                schema_path = Path(directory) / "schema.json"
+                schema_path.write_text(json.dumps({"columns": [
+                    {"name": "active", "type": "boolean"},
+                    {"name": "email", "type": "string", "required_when": "nope"},
+                ]}), encoding="utf-8")
+                output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+                output.write_text("keep me\n", encoding="utf-8")
+                command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                           "--schema", str(schema_path), "--output", str(output),
+                           "--errors", str(errors), "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("required_when", payload["error"])
+                self.assertIn("email", payload["error"])
+                self.assertIn("nope", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
+
+
 class DeduplicateByTests(unittest.TestCase):
     """Optional keep-first deduplication over final converted values."""
 

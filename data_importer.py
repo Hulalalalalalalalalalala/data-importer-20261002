@@ -293,6 +293,36 @@ def _lte_field_errors(record, field_errors, lte_fields):
     return errors
 
 
+def _required_when_field_errors(record, field_errors, required_when):
+    """Check every declared ``required_when`` condition over final values.
+
+    Runs after structure checks, marker matching, default filling, type
+    conversion and the enum, range, pattern and lte_field checks. A
+    condition is skipped when either participating field already carries
+    an error; the original errors are kept and every other condition on
+    the row is still checked. Conditions are evaluated in schema column
+    order and returned as ``(name, message)`` pairs so the caller can
+    file each error under its declaring column's position. The rule
+    fires only when the condition column's final boolean is true and the
+    declaring column's final value is null -- a false or null condition
+    never fires, and a final 0 or false on the declaring column counts
+    as a value. A violation names ``required_when``, both output names
+    and the true condition value.
+    """
+    errors = []
+    for name, target in required_when:
+        if name in field_errors or target in field_errors:
+            continue
+        if record.get(target) is not True:
+            continue
+        if record.get(name) is not None:
+            continue
+        errors.append((
+            name,
+            f"{name}: value is null but required_when {target!r} is true"))
+    return errors
+
+
 def _prepare_lte_fields(columns):
     """Validate the optional ``lte_field`` reference of each integer column.
 
@@ -333,6 +363,50 @@ def _prepare_lte_fields(columns):
                 f"column {name!r} lte_field {target!r} must reference an integer column")
         lte_fields.append((name, target))
     return lte_fields
+
+
+def _prepare_required_when(columns):
+    """Validate the optional ``required_when`` reference of each column.
+
+    Returns a list of ``(name, target)`` pairs in schema column order, one
+    entry per declaring column. The attribute may appear on a column of
+    any type and must be a non-blank string naming another ``boolean``
+    column by its output name, matched verbatim and case-sensitively (the
+    text is never trimmed and source aliases are not recognized); the
+    condition column may be declared before or after the declaring
+    column. A non-string, a blank string, an unknown field, a self
+    reference or a non-boolean target is a configuration error. Raises
+    ValueError naming ``required_when``, the declaring output field and
+    the attribute value before the input is read; the caller's schema is
+    never mutated.
+    """
+    by_name = {column["name"]: column for column in columns}
+    required_when = []
+    for column in columns:
+        name = column["name"]
+        if "required_when" not in column:
+            continue
+        target = column["required_when"]
+        if not isinstance(target, str):
+            raise ValueError(
+                f"column {name!r} required_when {target!r} must be a string naming "
+                "a boolean column")
+        if not target.strip():
+            raise ValueError(
+                f"column {name!r} required_when {target!r} must be a non-blank string")
+        if target == name:
+            raise ValueError(
+                f"column {name!r} required_when {target!r} must not reference "
+                "the column itself")
+        if target not in by_name:
+            raise ValueError(
+                f"column {name!r} required_when {target!r} is not a schema column name")
+        if by_name[target]["type"] != "boolean":
+            raise ValueError(
+                f"column {name!r} required_when {target!r} must reference "
+                "a boolean column")
+        required_when.append((name, target))
+    return required_when
 
 
 def _prepare_patterns(columns, defaults):
@@ -545,7 +619,11 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding
+    # The required_when references are validated only after every
+    # pre-existing configuration check (structure, per-column attributes
+    # and sources) has passed.
+    required_when = _prepare_required_when(columns)
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when
 
 
 def _prepare_field_list(fields, names, option):
@@ -836,7 +914,7 @@ def _nfkc(value):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None, filter_in=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -959,6 +1037,13 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                     for name, message in _lte_field_errors(
                             record, field_error_names, lte_fields):
                         slots[column_index[name]].append(message)
+                        # An lte_field violation is a pre-existing field
+                        # error as far as the required_when conditions
+                        # below are concerned.
+                        field_error_names.add(name)
+                    for name, message in _required_when_field_errors(
+                            record, field_error_names, required_when):
+                        slots[column_index[name]].append(message)
                     row_errors = [message for slot in slots for message in slot]
                 if row_errors:
                     errors.append({"row": start_line, "errors": row_errors})
@@ -1035,7 +1120,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None, filter_in=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1119,6 +1204,13 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     record[name] = converted
             for name, message in _lte_field_errors(
                     record, field_error_names, lte_fields):
+                slots[column_index[name]].append(message)
+                # An lte_field violation is a pre-existing field error
+                # as far as the required_when conditions below are
+                # concerned.
+                field_error_names.add(name)
+            for name, message in _required_when_field_errors(
+                    record, field_error_names, required_when):
                 slots[column_index[name]].append(message)
             row_errors = [message for slot in slots for message in slot]
             if row_errors:
