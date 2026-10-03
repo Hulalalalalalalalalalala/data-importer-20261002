@@ -67,23 +67,79 @@ def _prepare_casefold(columns):
     return folding
 
 
-def _process_string_text(value, name, normalizing, casefolding):
-    """Finish a non-empty string value through trim, NFKC and casefold.
+def _prepare_collapse_whitespace(columns):
+    """Validate the optional per-column ``collapse_whitespace`` attribute.
+
+    Returns the set of output field names that opt in. The attribute may
+    appear only on ``string`` columns and its value must be a boolean:
+    ``true`` enables merging of every interior run of whitespace into a
+    single ASCII space, ``false`` keeps the previous behavior, and a
+    non-boolean value or a declaration on an ``integer`` or ``boolean``
+    column is a configuration error. Raises ValueError naming
+    ``collapse_whitespace``, the output field and the offending value
+    before the input is read; the caller's schema is never mutated.
+    """
+    collapsing = set()
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "collapse_whitespace" not in column:
+            continue
+        enabled = column["collapse_whitespace"]
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                f"column {name!r} collapse_whitespace {enabled!r} must be a boolean")
+        if kind != "string":
+            raise ValueError(
+                f"column {name!r} collapse_whitespace {enabled!r} requires a string column")
+        if enabled:
+            collapsing.add(name)
+    return collapsing
+
+
+def _collapse_whitespace(value):
+    """Replace each interior run of whitespace with one ASCII space.
+
+    Whitespace follows Python ``str.isspace()`` exactly (so the
+    zero-width space U+200B, which is not whitespace, is kept verbatim)
+    and every maximal run becomes a single ``" "``. Runs are merged but
+    no character is deleted, so a non-empty string stays non-empty and
+    the value -- already trimmed on arrival, and NFKC-normalized plus
+    re-trimmed before this step when that normalization is enabled --
+    gains no fresh leading or trailing space.
+    """
+    pieces = []
+    inside_run = False
+    for char in value:
+        if char.isspace():
+            if not inside_run:
+                pieces.append(" ")
+                inside_run = True
+        else:
+            pieces.append(char)
+            inside_run = False
+    return "".join(pieces)
+
+
+def _process_string_text(value, name, normalizing, collapsing, casefolding):
+    """Finish a non-empty string value through trim, NFKC, collapse and fold.
 
     Runs the column's declared string normalizations in the established
     order (the value arrives already trimmed): NFKC plus a second trim
-    when the column opts in, then case folding. Returns the processed
-    text; the empty-value flows (default, required, null) are handled by
-    the caller when NFKC collapses the text to blank.
+    when the column opts in, then whitespace collapsing when the column
+    opts in, then case folding. Returns the processed text; the
+    empty-value flows (default, required, null) are handled by the
+    caller when NFKC collapses the text to blank.
     """
     if name in normalizing:
         value = _nfkc(value)
+    if name in collapsing:
+        value = _collapse_whitespace(value)
     if name in casefolding:
         value = value.casefold()
     return value
 
 
-def _prepare_value_maps(columns, normalizing, casefolding):
+def _prepare_value_maps(columns, normalizing, collapsing, casefolding):
     """Validate the optional per-column ``value_map`` attribute.
 
     Returns a mapping of output field name to the processed entries as a
@@ -92,13 +148,15 @@ def _prepare_value_maps(columns, normalizing, casefolding):
     non-empty object whose keys and mapped values are strings; declared
     keys and targets are first trimmed, then run through the column's
     existing string normalization in the same order an incoming string
-    gets (NFKC plus a second trim when enabled, then case folding). A key
-    that processes to blank, a non-string key or value, a declaration on
-    an ``integer`` or ``boolean`` column, or two keys that process to the
-    same text are configuration errors -- the latter even when both keys
-    map to the same target. Raises ValueError naming ``value_map``, the
-    output field and the offending value before the input is read; the
-    caller's schema dicts are never mutated.
+    gets (NFKC plus a second trim when enabled, then whitespace
+    collapsing when enabled, then case folding). A key that processes to
+    blank, a non-string key or value, a declaration on an ``integer`` or
+    ``boolean`` column, or two keys that process to the same text are
+    configuration errors -- the latter even when both keys map to the
+    same target, and keys merged equal by whitespace collapsing count as
+    a clash. Raises ValueError naming ``value_map``, the output field and
+    the offending value before the input is read; the caller's schema
+    dicts are never mutated.
     """
     maps = {}
     for column in columns:
@@ -132,12 +190,12 @@ def _prepare_value_maps(columns, normalizing, casefolding):
                     f"column {name!r} value_map value {target!r} for key {key!r} "
                     "must not be blank")
             processed_key = _process_string_text(
-                processed_key, name, normalizing, casefolding)
+                processed_key, name, normalizing, collapsing, casefolding)
             if not processed_key:
                 raise ValueError(
                     f"column {name!r} value_map key {key!r} must not normalize to blank")
             processed_target = _process_string_text(
-                processed_target, name, normalizing, casefolding)
+                processed_target, name, normalizing, collapsing, casefolding)
             if not processed_target:
                 raise ValueError(
                     f"column {name!r} value_map value {target!r} for key {key!r} "
@@ -167,18 +225,21 @@ def _mapped_string(value, entries):
     return value
 
 
-def _prepare_defaults(columns, normalizing=frozenset(), casefolding=frozenset()):
+def _prepare_defaults(columns, normalizing=frozenset(), collapsing=frozenset(),
+                      casefolding=frozenset()):
     """Validate the optional target-typed ``default`` of each column.
 
     Returns a mapping of output field name to the processed default
     (string defaults are trimmed; a string column opting into NFKC also
-    has its default NFKC-normalized and re-trimmed, and a string column
-    opting into case folding then has it casefolded, in that order). A
-    malformed default is a configuration error naming the default value
-    and output field, raised before the input is read; the caller's
-    schema dicts are never mutated. A normalized string default that
-    becomes blank is refused here so the later ``allowed_values``
-    membership check keeps using the final emitted text.
+    has its default NFKC-normalized and re-trimmed; a string column
+    opting into whitespace collapsing then has its interior runs
+    merged; and a string column opting into case folding then has it
+    casefolded, in that order). A malformed default is a configuration
+    error naming the default value and output field, raised before the
+    input is read; the caller's schema dicts are never mutated. A
+    normalized string default that becomes blank is refused here so the
+    later ``allowed_values`` membership check keeps using the final
+    emitted text.
     """
     defaults = {}
     for column in columns:
@@ -197,6 +258,10 @@ def _prepare_defaults(columns, normalizing=frozenset(), casefolding=frozenset())
                 if not processed:
                     raise ValueError(
                         f"column {name!r} default {default!r} must not normalize to blank")
+            if name in collapsing:
+                # Collapsing merges runs into spaces but deletes nothing,
+                # so a non-empty, already-trimmed default stays non-empty.
+                processed = _collapse_whitespace(processed)
             if name in casefolding:
                 # Case folding never blanks a non-blank string, so the
                 # folded default needs no further emptiness check.
@@ -711,8 +776,9 @@ def _prepare_schema(schema):
     columns = schema["columns"]
     normalizing = _prepare_unicode_normalization(columns)
     casefolding = _prepare_casefold(columns)
-    value_maps = _prepare_value_maps(columns, normalizing, casefolding)
-    defaults = _prepare_defaults(columns, normalizing, casefolding)
+    collapsing = _prepare_collapse_whitespace(columns)
+    value_maps = _prepare_value_maps(columns, normalizing, collapsing, casefolding)
+    defaults = _prepare_defaults(columns, normalizing, collapsing, casefolding)
     allowed = _prepare_allowed_values(columns, defaults, value_maps)
     markers = _prepare_missing_values(columns)
     aliases = _prepare_boolean_aliases(columns)
@@ -739,7 +805,7 @@ def _prepare_schema(schema):
     # pre-existing configuration check (structure, per-column attributes
     # and sources) has passed.
     required_when = _prepare_required_when(columns)
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, collapsing, patterns, casefolding, required_when, value_maps
 
 
 def _prepare_field_list(fields, names, option):
@@ -1108,7 +1174,7 @@ def _nfkc(value):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None, filter_in=None, filter_range=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, collapsing, patterns, casefolding, required_when, value_maps = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1202,6 +1268,16 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                                             raise ValueError("required value is empty")
                                         else:
                                             converted = None
+                                if isinstance(converted, str) and name in collapsing:
+                                    # Whitespace collapsing runs after NFKC
+                                    # (and its second trim) and before case
+                                    # folding and the single value_map
+                                    # lookup: every interior run of
+                                    # str.isspace characters becomes one
+                                    # ASCII space. A filled default was
+                                    # collapsed at load, so collapsing it
+                                    # again is idempotent; null stays null.
+                                    converted = _collapse_whitespace(converted)
                                 if isinstance(converted, str) and name in casefolding:
                                     # Case folding runs last, on the final
                                     # string (a filled default was already
@@ -1261,7 +1337,8 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
 
 
 def _convert_jsonl_value(column, value, defaults, markers, aliases,
-                         normalizing=frozenset(), casefolding=frozenset()):
+                         normalizing=frozenset(), collapsing=frozenset(),
+                         casefolding=frozenset()):
     """Convert one decoded JSON value. Returns (converted, error_message)."""
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
@@ -1292,6 +1369,13 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
                     return None, f"{name}: required value is empty"
                 return None, None
             value = normalized
+        if name in collapsing:
+            # Whitespace collapsing runs after NFKC (and its second trim)
+            # and before case folding: every interior run of
+            # str.isspace characters becomes one ASCII space. A filled
+            # default was collapsed at load, so collapsing it again is
+            # idempotent.
+            value = _collapse_whitespace(value)
         if name in casefolding:
             # Case folding runs last, on the final string, before the
             # enum, range and pattern checks.
@@ -1322,7 +1406,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None, filter_in=None, filter_range=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, collapsing, patterns, casefolding, required_when, value_maps = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1384,7 +1468,7 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                 name = column["name"]
                 converted, message = _convert_jsonl_value(
                     column, obj[origin], defaults, markers, aliases, normalizing,
-                    casefolding)
+                    collapsing, casefolding)
                 if message is not None:
                     slots[index].append(message)
                     field_error_names.add(name)
