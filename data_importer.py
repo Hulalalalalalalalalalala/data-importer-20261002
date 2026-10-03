@@ -1079,9 +1079,50 @@ def _deduplicate_records(records, deduplicate_by):
     return kept, len(records) - len(kept)
 
 
+def _prepare_report_missing(report_missing):
+    """Validate the optional missing-report switch.
+
+    The value must be a boolean (``True`` enables the report, ``False``
+    keeps the previous result structure); anything else raises ValueError
+    naming ``report_missing`` and the offending value. The check runs
+    after every pre-existing configuration check has passed and before
+    the input is read.
+    """
+    if not isinstance(report_missing, bool):
+        raise ValueError(f"report_missing {report_missing!r} must be a boolean")
+
+
+def _build_missing_report(kept, names, missing_events):
+    """Aggregate the per-field missing report over the final kept records.
+
+    Only records surviving validation, filtering and keep-first dedup
+    count: ``missing_events`` maps id(record) to the field events recorded
+    during conversion (``"defaulted"`` when the empty-value flow filled a
+    default, ``"null"`` when it stayed null), so filtered-out and
+    dedup-removed records never contribute. Every schema column appears in
+    declared order, with zero counts when no kept record (or no record at
+    all) entered the missing flow for it; ``missing`` always equals
+    ``defaulted`` plus ``null``.
+    """
+    report = []
+    for name in names:
+        defaulted = 0
+        null_count = 0
+        for record in kept:
+            event = missing_events.get(id(record), {}).get(name)
+            if event == "defaulted":
+                defaulted += 1
+            elif event == "null":
+                null_count += 1
+        report.append({"field": name, "missing": defaulted + null_count,
+                       "defaulted": defaulted, "null": null_count})
+    return report
+
+
 def _build_result(records, errors, duplicate_fields, filter_condition,
                   deduplicate_fields=None, filter_in_condition=None,
-                  filter_range_condition=None):
+                  filter_range_condition=None, missing_report_fields=None,
+                  missing_events=None):
     """Filter fully validated records, then keep-first dedup, then counts.
 
     Order is: validation (already done by the caller), ``filter_eq``,
@@ -1089,7 +1130,10 @@ def _build_result(records, errors, duplicate_fields, filter_condition,
     enabled predicate matches, so the conditions combine as AND;
     ``filtered`` counts each removed record once), keep-first
     deduplication over the filter survivors, and finally the duplicate
-    report over the records that remain.
+    report over the records that remain. When ``missing_report_fields`` is
+    not None it holds the schema output names in declared order and a
+    ``missing_report`` array is added, aggregated by ``_build_missing_report``
+    over the final kept records only.
     """
     filtering = (filter_condition is not None or filter_in_condition is not None
                  or filter_range_condition is not None)
@@ -1136,6 +1180,9 @@ def _build_result(records, errors, duplicate_fields, filter_condition,
         result["deduplicated"] = deduplicated_count
     if duplicate_fields is not None:
         result["duplicates"] = _find_duplicates(kept, duplicate_fields)
+    if missing_report_fields is not None:
+        result["missing_report"] = _build_missing_report(
+            kept, missing_report_fields, missing_events)
     return result
 
 
@@ -1221,7 +1268,8 @@ def _convert_integer_text(value, name, grouping):
 
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
-                  deduplicate_by=None, filter_in=None, filter_range=None):
+                  deduplicate_by=None, filter_in=None, filter_range=None,
+                  *, report_missing=False):
     columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps, collapsing, thousands = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
@@ -1230,7 +1278,12 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
     filter_condition = _prepare_filter_eq(filter_eq, columns)
     filter_in_condition = _prepare_filter_in(filter_in, columns)
     filter_range_condition = _prepare_filter_range(filter_range, columns)
+    _prepare_report_missing(report_missing)
     records, errors = [], []
+    # Per accepted record, the fields that entered the empty-value flow
+    # ("defaulted" or "null"), keyed by id(record); only collected when
+    # the missing report is enabled.
+    missing_events = {} if report_missing else None
     # strict=True turns the two quote-syntax problems that a lenient reader
     # silently folds into the data into csv.Error: a quoted field still open
     # at EOF and any character other than comma/newline/EOF right after a
@@ -1263,6 +1316,7 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                     # still occupies a physical line number (tracked above).
                     continue
                 record = {}
+                row_missing = {}
                 if len(cells) != len(sources):
                     row_errors = ["wrong number of cells"]
                 else:
@@ -1283,12 +1337,17 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                             value = ""
                         try:
                             if not value:
+                                # A trimmed-empty cell or a matched missing
+                                # marker enters the empty-value flow and
+                                # counts as missing for the report.
                                 if name in defaults:
                                     converted = defaults[name]
+                                    row_missing[name] = "defaulted"
                                 elif column.get("required", False):
                                     raise ValueError("required value is empty")
                                 else:
                                     converted = None
+                                    row_missing[name] = "null"
                             elif kind == "integer":
                                 converted = _convert_integer_text(value, name, thousands)
                             elif kind == "boolean":
@@ -1310,12 +1369,16 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                                         # empty-value flow; markers are not
                                         # matched a second time and a filled
                                         # default was normalized at load.
+                                        # It counts as missing for the
+                                        # report.
                                         if name in defaults:
                                             converted = defaults[name]
+                                            row_missing[name] = "defaulted"
                                         elif column.get("required", False):
                                             raise ValueError("required value is empty")
                                         else:
                                             converted = None
+                                            row_missing[name] = "null"
                                 if isinstance(converted, str) and name in collapsing:
                                     # Whitespace collapsing runs after
                                     # NFKC and its re-trim and before case
@@ -1374,6 +1437,8 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                     errors.append({"row": start_line, "errors": row_errors})
                 else:
                     records.append(record)
+                    if missing_events is not None:
+                        missing_events[id(record)] = row_missing
         except csv.Error as exc:
             raise _csv_parse_error(
                 source, previous_end + 1, _csv_error_reason(exc)) from None
@@ -1381,13 +1446,20 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
             raise ValueError("CSV header must match schema column sources and order exactly")
     return _build_result(records, errors, duplicate_fields, filter_condition,
                          deduplicate_fields, filter_in_condition,
-                         filter_range_condition)
+                         filter_range_condition,
+                         names if report_missing else None, missing_events)
 
 
 def _convert_jsonl_value(column, value, defaults, markers, aliases,
                          normalizing=frozenset(), collapsing=frozenset(),
                          casefolding=frozenset(), thousands=frozenset()):
-    """Convert one decoded JSON value. Returns (converted, error_message)."""
+    """Convert one decoded JSON value.
+
+    Returns (converted, error_message, missing_event). ``missing_event``
+    is None unless the value entered the empty-value flow: ``"defaulted"``
+    when a declared default filled it, ``"null"`` when it stayed null
+    (a required-empty error carries None, since the row is rejected).
+    """
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
         value = value.strip()
@@ -1397,25 +1469,28 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
             # empty-value flow before any type conversion.
             value = ""
     if value is None or value == "":
+        # JSON null, a trimmed-empty string and a matched marker all enter
+        # the empty-value flow and count as missing for the report.
         if name in defaults:
-            return defaults[name], None
+            return defaults[name], None, "defaulted"
         if column.get("required", False):
-            return None, f"{name}: required value is empty"
-        return None, None
+            return None, f"{name}: required value is empty", None
+        return None, None, "null"
     if kind == "string":
         if not isinstance(value, str):
-            return None, f"{name}: expected string"
+            return None, f"{name}: expected string", None
         if name in normalizing:
             normalized = _nfkc(value)
             if not normalized:
                 # NFKC collapsed a non-empty string to blank: the ordinary
                 # empty-value flow applies, without matching markers again;
-                # a filled default was normalized at load.
+                # a filled default was normalized at load. It counts as
+                # missing for the report.
                 if name in defaults:
-                    return defaults[name], None
+                    return defaults[name], None, "defaulted"
                 if column.get("required", False):
-                    return None, f"{name}: required value is empty"
-                return None, None
+                    return None, f"{name}: required value is empty", None
+                return None, None, "null"
             value = normalized
         if name in collapsing:
             # Whitespace collapsing runs after NFKC and its re-trim and
@@ -1426,36 +1501,37 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
             # Case folding runs last, on the final string, before the
             # enum, range and pattern checks.
             value = value.casefold()
-        return value, None
+        return value, None, None
     if kind == "integer":
         if isinstance(value, bool):
-            return None, f"{name}: expected integer"
+            return None, f"{name}: expected integer", None
         if isinstance(value, int):
-            return value, None
+            return value, None, None
         if isinstance(value, str):
             try:
-                return _convert_integer_text(value, name, thousands), None
+                return _convert_integer_text(value, name, thousands), None, None
             except ValueError as exc:
                 if name in thousands and "," in value:
                     # A comma-grouped text that fails the grouping pattern
                     # reports its own error; every other failing text keeps
                     # the ordinary integer type error below.
-                    return None, f"{name}: {exc}"
-        return None, f"{name}: expected integer"
+                    return None, f"{name}: {exc}", None
+        return None, f"{name}: expected integer", None
     if isinstance(value, bool):
-        return value, None
+        return value, None, None
     if isinstance(value, str):
         folded = value.casefold()
         if folded in ("true", "false"):
-            return folded == "true", None
+            return folded == "true", None, None
         column_aliases = aliases.get(name)
         if column_aliases is not None and folded in column_aliases:
-            return column_aliases[folded], None
-    return None, f"{name}: boolean must be true or false"
+            return column_aliases[folded], None, None
+    return None, f"{name}: boolean must be true or false", None
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
-                    deduplicate_by=None, filter_in=None, filter_range=None):
+                    deduplicate_by=None, filter_in=None, filter_range=None,
+                    *, report_missing=False):
     columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps, collapsing, thousands = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
@@ -1464,8 +1540,13 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
     filter_condition = _prepare_filter_eq(filter_eq, columns)
     filter_in_condition = _prepare_filter_in(filter_in, columns)
     filter_range_condition = _prepare_filter_range(filter_range, columns)
+    _prepare_report_missing(report_missing)
     expected = set(sources)
     records, errors = [], []
+    # Per accepted record, the fields that entered the empty-value flow
+    # ("defaulted" or "null"), keyed by id(record); only collected when
+    # the missing report is enabled.
+    missing_events = {} if report_missing else None
     decoded_pairs = []
 
     def pairs_hook(pairs):
@@ -1510,15 +1591,18 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                 errors.append({"row": row_number, "errors": row_errors})
                 continue
             record = {}
+            row_missing = {}
             # One slot per column keeps field errors and the lte_field
             # relation error attributed to a column in schema order.
             slots = [[] for _ in columns]
             field_error_names = set()
             for index, (column, origin) in enumerate(zip(columns, sources)):
                 name = column["name"]
-                converted, message = _convert_jsonl_value(
+                converted, message, missing_event = _convert_jsonl_value(
                     column, obj[origin], defaults, markers, aliases, normalizing,
                     collapsing, casefolding, thousands)
+                if missing_event is not None:
+                    row_missing[name] = missing_event
                 if message is not None:
                     slots[index].append(message)
                     field_error_names.add(name)
@@ -1561,9 +1645,12 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                 errors.append({"row": row_number, "errors": row_errors})
             else:
                 records.append(record)
+                if missing_events is not None:
+                    missing_events[id(record)] = row_missing
     return _build_result(records, errors, duplicate_fields, filter_condition,
                          deduplicate_fields, filter_in_condition,
-                         filter_range_condition)
+                         filter_range_condition,
+                         names if report_missing else None, missing_events)
 
 
 def write_jsonl(path, records):
@@ -1826,6 +1913,8 @@ def main():
                         help='set-membership condition as JSON, e.g. {"field": "orders", "values": [3, null]}')
     parser.add_argument("--filter-range", metavar="JSON",
                         help='inclusive integer range condition as JSON, e.g. {"field": "orders", "minimum": 3, "maximum": 5}')
+    parser.add_argument("--report-missing", action="store_true",
+                        help="include a per-field missing/defaulted/null report in the summary")
     args = parser.parse_args()
     try:
         _check_path_isolation(args.source, args.schema, args.output, args.errors)
@@ -1868,7 +1957,7 @@ def main():
         result = normalize(args.source, schema,
                            duplicate_by=args.duplicate_by, filter_eq=filter_eq,
                            deduplicate_by=args.deduplicate_by, filter_in=filter_in,
-                           filter_range=filter_range)
+                           filter_range=filter_range, report_missing=args.report_missing)
         if args.output_format == "csv":
             names = [column["name"] for column in schema["columns"]]
             output_payload = _csv_payload(names, result["records"])
@@ -1885,6 +1974,8 @@ def main():
             summary["deduplicated"] = result["deduplicated"]
         if args.duplicate_by is not None:
             summary["duplicates"] = result["duplicates"]
+        if args.report_missing:
+            summary["missing_report"] = result["missing_report"]
         print(json.dumps(summary))
         return 1 if result["rejected"] else 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
