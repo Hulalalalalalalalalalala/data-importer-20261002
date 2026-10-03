@@ -4299,6 +4299,268 @@ class UnicodeNormalizationTests(unittest.TestCase):
                 self.assertEqual(records, self.expected_records())
 
 
+class CasefoldTests(unittest.TestCase):
+    """Optional Unicode case folding (``str.casefold()``) for ``string`` columns."""
+
+    FULLWIDTH_STRASSE = "ＳＴＲＡＳＳＥ"
+
+    def schema(self, **overrides):
+        column = {"name": "code", "type": "string", "default": "Straße",
+                  "allowed_values": ["strasse"],
+                  "unicode_normalization": "NFKC", "casefold": True}
+        column.update(overrides)
+        return {"columns": [column]}
+
+    def write_csv(self, directory, text):
+        path = Path(directory) / "data.csv"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_jsonl(self, directory, values, key="code"):
+        path = Path(directory) / "data.jsonl"
+        path.write_text("".join(json.dumps({key: value}, ensure_ascii=False) + "\n"
+                                for value in values), encoding="utf-8")
+        return path
+
+    def write_sample_pair(self, directory):
+        csv_path = self.write_csv(
+            directory,
+            "code\n " + self.FULLWIDTH_STRASSE + " \nStraße\nSTRASSE\n\"\"\nx\n")
+        jsonl_path = self.write_jsonl(
+            directory,
+            [" " + self.FULLWIDTH_STRASSE + " ", "Straße", "STRASSE", None, "x"])
+        return ((normalize_csv, csv_path, 6), (normalize_jsonl, jsonl_path, 5))
+
+    def test_fixed_sample_csv_and_jsonl(self):
+        # Padded full-width ＳＴＲＡＳＳＥ, Straße, STRASSE, the empty value
+        # (filled with the folded Straße default) and illegal x: four
+        # identical strasse records survive, x is rejected, both formats agree.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for normalize, path, bad_row in self.write_sample_pair(directory):
+                result = normalize(path, self.schema(), duplicate_by=["code"])
+                self.assertEqual(result["records"], [{"code": "strasse"}] * 4)
+                self.assertEqual((result["accepted"], result["rejected"]), (4, 1))
+                self.assertEqual(result["duplicates"], [
+                    {"key": {"code": "strasse"}, "record_numbers": [1, 2, 3, 4]},
+                ])
+                self.assertEqual(result["errors"][0]["row"], bad_row)
+                self.assertIn("allowed_values", result["errors"][0]["errors"][0])
+                deduped = normalize(path, self.schema(), deduplicate_by=["code"])
+                self.assertEqual(deduped["records"], [{"code": "strasse"}])
+                self.assertEqual(deduped["deduplicated"], 3)
+
+    def test_casefold_without_nfkc(self):
+        schema = {"columns": [{"name": "code", "type": "string",
+                               "allowed_values": ["strasse"], "casefold": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nStraße\nSTRASSE\nstrasse\n")
+            jsonl_path = self.write_jsonl(directory, ["Straße", "STRASSE", "strasse"])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                result = normalize(path, schema)
+                self.assertEqual(result["records"], [{"code": "strasse"}] * 3)
+                # full-width input is not folded onto ASCII without NFKC
+                other = self.write_csv(directory, "code\n" + self.FULLWIDTH_STRASSE + "\n")
+                self.assertEqual(normalize_csv(other, schema)["rejected"], 1)
+
+    def test_false_or_absent_keeps_old_behavior(self):
+        for column in ({"name": "code", "type": "string"},
+                       {"name": "code", "type": "string", "casefold": False}):
+            schema = {"columns": [column]}
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                csv_path = self.write_csv(directory, "code\nStraße\nSTRASSE\n")
+                result = normalize_csv(csv_path, schema)
+            self.assertEqual([r["code"] for r in result["records"]],
+                             ["Straße", "STRASSE"])
+
+    def test_default_is_folded_before_validation(self):
+        # an uppercase default folds into the verbatim lowercase enum
+        schema = self.schema(default="STRASSE")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'code\n""\n')
+            jsonl_path = self.write_jsonl(directory, [None])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                self.assertEqual(normalize(path, schema)["records"],
+                                 [{"code": "strasse"}])
+        # a default whose folded text violates an existing constraint is a
+        # configuration error raised before the input is read
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        for bad_schema in (
+                self.schema(default="x"),
+                self.schema(pattern="[a-z]{4}", default="STRASSE")):
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, bad_schema)
+            message = str(caught.exception)
+            self.assertIn("default", message)
+            self.assertIn("code", message)
+            with self.assertRaises(ValueError):
+                normalize_jsonl(missing, bad_schema)
+
+    def test_markers_match_once_before_folding(self):
+        # Marker "strasse" matches the literal input, but "STRASSE" only
+        # becomes "strasse" through folding and must not be marker-matched.
+        schema = {"columns": [{"name": "code", "type": "string",
+                               "missing_values": ["strasse"], "casefold": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nstrasse\nSTRASSE\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"code": None}, {"code": "strasse"}])
+
+    def test_default_is_not_marker_matched(self):
+        schema = {"columns": [{"name": "code", "type": "string",
+                               "missing_values": ["strasse"], "default": "STRASSE",
+                               "casefold": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'code\n""\n')
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"code": "strasse"}])
+
+    def test_config_texts_and_names_are_not_folded(self):
+        # allowed_values entries stay verbatim: the folded input does not
+        # match an uppercase entry.
+        schema = {"columns": [{"name": "code", "type": "string",
+                               "allowed_values": ["STRASSE"], "casefold": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nStraße\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual((result["accepted"], result["rejected"]), (0, 1))
+        # filter_eq values stay verbatim: the pre-fold spelling matches nothing.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for normalize, path, _ in self.write_sample_pair(directory):
+                folded = normalize(path, self.schema(),
+                                   filter_eq={"field": "code", "value": "STRASSE"})
+                self.assertEqual(folded["accepted"], 0)
+                self.assertEqual(folded["filtered"], 4)
+                kept = normalize(path, self.schema(),
+                                 filter_eq={"field": "code", "value": "strasse"})
+                self.assertEqual(kept["accepted"], 4)
+        # field names, source aliases, CSV headers and JSONL keys stay literal.
+        schema = {"columns": [{"name": "code", "type": "string", "source": "CODE",
+                               "casefold": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "CODE\nSTRASSE\n")
+            self.assertEqual(normalize_csv(csv_path, schema)["records"],
+                             [{"code": "strasse"}])
+            jsonl_path = self.write_jsonl(directory, ["STRASSE"], key="CODE")
+            self.assertEqual(normalize_jsonl(jsonl_path, schema)["records"],
+                             [{"code": "strasse"}])
+
+    def test_optional_empty_stays_null_and_required_keeps_error(self):
+        optional = {"columns": [{"name": "code", "type": "string",
+                                 "casefold": True}]}
+        required = {"columns": [{"name": "code", "type": "string",
+                                 "required": True, "casefold": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'code\n""\n')
+            jsonl_path = self.write_jsonl(directory, [None])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                self.assertEqual(normalize(path, optional)["records"], [{"code": None}])
+                result = normalize(path, required)
+                self.assertEqual(result["rejected"], 1)
+                self.assertIn("required", result["errors"][0]["errors"][0])
+
+    def test_jsonl_non_string_keeps_type_error(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "data.jsonl"
+            path.write_text('{"code": 4}\n{"code": ["x"]}\n', encoding="utf-8")
+            result = normalize_jsonl(path, self.schema())
+        self.assertEqual(result["rejected"], 2)
+        self.assertTrue(all(row["errors"] == ["code: expected string"]
+                            for row in result["errors"]))
+
+    def test_invalid_attribute_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        bad_values = ["true", "yes", 1, 0, None, [True], {"casefold": True}]
+        for value in bad_values:
+            schema = {"columns": [{"name": "f", "type": "string",
+                                   "casefold": value}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("casefold", message, value)
+            self.assertIn("f", message, value)
+            self.assertIn(repr(value), message, value)
+            with self.assertRaises(ValueError):
+                normalize_jsonl(missing, schema)
+        for kind in ("integer", "boolean"):
+            schema = {"columns": [{"name": "f", "type": kind, "casefold": True}]}
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("casefold", message)
+            self.assertIn("f", message)
+            self.assertIn(repr(True), message)
+            with self.assertRaises(ValueError):
+                normalize_jsonl(missing, schema)
+
+    def test_structure_check_still_runs_first(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [{"name": "f", "casefold": "yes"}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertIn("schema", str(caught.exception))
+        self.assertNotIn("casefold", str(caught.exception))
+
+    def test_schema_dict_is_never_mutated(self):
+        import copy
+        schema = self.schema()
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nStraße\n")
+            normalize_csv(csv_path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_cli_bad_attribute_exit_two_keeps_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_csv(directory, "code\nx\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(
+                {"columns": [{"name": "code", "type": "string",
+                              "casefold": "yes"}]}),
+                encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("casefold", payload["error"])
+            self.assertIn("yes", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+    def test_cli_folds_and_exports_both_input_formats(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(
+                json.dumps(self.schema(), ensure_ascii=False), encoding="utf-8")
+            pairs = self.write_sample_pair(directory)
+            for normalize, source, _ in pairs:
+                fmt = "csv" if normalize is normalize_csv else "jsonl"
+                output = Path(directory) / f"out-{fmt}.jsonl"
+                errors = Path(directory) / f"err-{fmt}.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"),
+                           str(source), "--schema", str(schema_path),
+                           "--output", str(output), "--errors", str(errors),
+                           "--format", fmt,
+                           "--duplicate-by", "code", "--deduplicate-by", "code"]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                summary = json.loads(run.stdout)
+                self.assertEqual(summary["accepted"], 1)
+                self.assertEqual(summary["rejected"], 1)
+                self.assertEqual(summary["deduplicated"], 3)
+                self.assertEqual(summary["duplicates"], [])
+                records = [json.loads(line)
+                           for line in output.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(records, [{"code": "strasse"}])
+
+
 class PatternTests(unittest.TestCase):
     """Optional full-string ``pattern`` validation for ``string`` columns."""
 
