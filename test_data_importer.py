@@ -483,6 +483,167 @@ class ImporterTests(unittest.TestCase):
                 outputs.append((run.stdout, output.read_bytes(), errors.read_bytes()))
             self.assertEqual(outputs[0], outputs[1])
 
+    def test_filter_in_orders_scenario_csv(self):
+        # Valid orders values 3, 4, null, 3 plus one invalid text row;
+        # values [3, null] keeps three, filters one, rejects one.
+        text = ("name,orders,active\n"
+                "a,3,true\n"
+                "b,4,true\n"
+                "c,,true\n"
+                "d,3,false\n"
+                "e,x,true\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema,
+                                   filter_in={"field": "orders", "values": [3, None]})
+            deduped = normalize_csv(csv_path, self.schema,
+                                    filter_in={"field": "orders", "values": [3, None]},
+                                    deduplicate_by=["orders"])
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (3, 1, 1))
+        self.assertEqual([r["name"] for r in result["records"]], ["a", "c", "d"])
+        self.assertEqual(result["errors"][0]["row"], 6)
+        self.assertEqual((deduped["accepted"], deduped["deduplicated"]), (2, 1))
+        self.assertEqual([r["name"] for r in deduped["records"]], ["a", "c"])
+
+    def test_filter_in_string_and_boolean_csv(self):
+        text = ("name,orders,active\n"
+                "Maya,1,true\n"
+                "maya,2,false\n"
+                "Zed,3,true\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            names = normalize_csv(csv_path, self.schema,
+                                  filter_in={"field": "name", "values": ["Maya", "Zed"]})
+            folded = normalize_csv(csv_path, self.schema,
+                                   filter_in={"field": "name", "values": ["MAYA"]})
+            falsy = normalize_csv(csv_path, self.schema,
+                                  filter_in={"field": "active", "values": [False]})
+        # entries are verbatim: no trimming, normalization or case folding
+        self.assertEqual([r["name"] for r in names["records"]], ["Maya", "Zed"])
+        self.assertEqual(names["filtered"], 1)
+        self.assertEqual(folded["accepted"], 0)
+        self.assertEqual(folded["filtered"], 3)
+        self.assertEqual([r["name"] for r in falsy["records"]], ["maya"])
+
+    def test_filter_in_with_filter_eq_applies_and_csv(self):
+        text = ("name,orders,active\n"
+                "a,3,true\n"
+                "b,3,false\n"
+                "c,4,true\n"
+                "d,3,true\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema,
+                                   filter_eq={"field": "active", "value": True},
+                                   filter_in={"field": "orders", "values": [3]})
+        # filter_eq alone keeps a, c, d; filter_in alone keeps a, b, d;
+        # the intersection keeps a and d, and b and c each count once.
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (2, 2, 0))
+        self.assertEqual([r["name"] for r in result["records"]], ["a", "d"])
+
+    def test_filter_in_disabled_or_none_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\na,1,true\nb,2,false\n")
+            omitted = normalize_csv(csv_path, self.schema)
+            explicit_none = normalize_csv(csv_path, self.schema, filter_in=None)
+        self.assertEqual(omitted, explicit_none)
+        self.assertEqual(set(omitted), {"records", "errors", "accepted", "rejected"})
+        self.assertNotIn("filtered", omitted)
+
+    def test_filter_in_invalid_config_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        cases = [
+            [], "x", 3, True,
+            {"field": "active"},
+            {"values": [True]},
+            {},
+            {"field": "active", "values": [True], "extra": 1},
+            {"field": 1, "values": [True]},
+            {"field": "  ", "values": [True]},
+            {"field": "nope", "values": [True]},
+            {"field": "active", "values": []},
+            {"field": "active", "values": "true"},
+            {"field": "active", "values": None},
+            {"field": "active", "values": [1]},
+            {"field": "active", "values": ["true"]},
+            {"field": "orders", "values": [True]},
+            {"field": "orders", "values": [1.0]},
+            {"field": "orders", "values": ["1"]},
+            {"field": "name", "values": [1]},
+            {"field": "name", "values": ["a", "a"]},
+            {"field": "orders", "values": [3, 3]},
+            {"field": "active", "values": [True, True]},
+            {"field": "orders", "values": [None, None]},
+        ]
+        for condition in cases:
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, self.schema, filter_in=condition)
+            self.assertIn("filter_in", str(caught.exception))
+        # source aliases are not recognized as field names
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "display_name,purchase_count,active\nMaya,3,TRUE\n")
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(csv_path, self.mapped_schema(),
+                              filter_in={"field": "purchase_count", "values": [3]})
+            self.assertIn("filter_in", str(caught.exception))
+
+    def test_cli_filter_in_flag(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,3,true\n"
+                "b,4,true\n"
+                "c,,true\n"
+                "d,3,false\n"
+                "e,x,true\n")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            run = run_cli(csv_path, output, errors,
+                          extra=("--filter-in", json.dumps({"field": "orders", "values": [3, None]})))
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout),
+                             {"accepted": 3, "rejected": 1, "filtered": 1})
+            self.assertEqual(len(output.read_text().splitlines()), 3)
+            self.assertEqual(len(errors.read_text().splitlines()), 1)
+
+    def test_cli_filter_in_with_filter_eq_and_dedup(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,3,true\n"
+                "b,3,false\n"
+                "c,4,true\n"
+                "d,3,true\n")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            run = run_cli(csv_path, output, errors,
+                          extra=("--filter-eq", json.dumps({"field": "active", "value": True}),
+                                 "--filter-in", json.dumps({"field": "orders", "values": [3, 4]}),
+                                 "--deduplicate-by", "orders"))
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout),
+                             {"accepted": 2, "rejected": 0, "filtered": 1, "deduplicated": 1})
+
+    def test_cli_filter_in_bad_condition_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\nA,3,TRUE\n")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            for condition in ("{bad json", "[1, 2]",
+                              json.dumps({"field": "nope", "values": [1]}),
+                              json.dumps({"field": "orders", "values": []}),
+                              json.dumps({"field": "orders", "values": [3, 3]})):
+                if output.exists():
+                    output.unlink()
+                output.write_text("keep me\n", encoding="utf-8")
+                self.assertFalse(errors.exists())
+                run = run_cli(csv_path, output, errors, extra=("--filter-in", condition))
+                self.assertEqual(run.returncode, 2, condition)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("filter_in", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
 
     def test_default_fills_empty_for_optional_and_required_csv(self):
         schema = {"columns": [
@@ -1375,6 +1536,148 @@ class JsonlImporterTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 normalize_jsonl(missing, self.schema, filter_eq=condition)
             self.assertIn("filter_eq", str(caught.exception))
+
+    def test_filter_in_jsonl_orders_scenario(self):
+        # Valid orders values 3, 4, null, 3 plus one invalid text row;
+        # values [3, null] keeps three, filters one, rejects one.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": 3, "active": true}\n'
+                '{"name": "b", "orders": 4, "active": true}\n'
+                '{"name": "c", "orders": null, "active": true}\n'
+                '{"name": "d", "orders": 3, "active": false}\n'
+                '{"name": "e", "orders": "x", "active": true}\n')
+            result = normalize_jsonl(path, self.schema,
+                                     filter_in={"field": "orders", "values": [3, None]})
+            deduped = normalize_jsonl(path, self.schema,
+                                      filter_in={"field": "orders", "values": [3, None]},
+                                      deduplicate_by=["orders"])
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (3, 1, 1))
+        self.assertEqual([r["name"] for r in result["records"]], ["a", "c", "d"])
+        self.assertEqual(result["errors"][0]["row"], 5)
+        self.assertEqual((deduped["accepted"], deduped["deduplicated"]), (2, 1))
+        self.assertEqual([r["name"] for r in deduped["records"]], ["a", "c"])
+
+    def test_filter_in_jsonl_string_boolean_and_defaults(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "default": 3},
+            {"name": "active", "type": "boolean", "required": True},
+        ]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "Maya", "orders": null, "active": true}\n'
+                '{"name": "maya", "orders": 1, "active": false}\n'
+                '{"name": "Zed", "orders": 4, "active": true}\n')
+            # the filled default 3 takes part in matching
+            defaulted = normalize_jsonl(path, schema,
+                                        filter_in={"field": "orders", "values": [3]})
+            names = normalize_jsonl(path, schema,
+                                    filter_in={"field": "name", "values": ["Maya", "Zed"]})
+            padded = normalize_jsonl(path, schema,
+                                     filter_in={"field": "name", "values": [" Maya "]})
+            falsy = normalize_jsonl(path, schema,
+                                    filter_in={"field": "active", "values": [False]})
+        self.assertEqual([r["name"] for r in defaulted["records"]], ["Maya"])
+        self.assertEqual(defaulted["filtered"], 2)
+        self.assertEqual([r["name"] for r in names["records"]], ["Maya", "Zed"])
+        self.assertEqual(padded["accepted"], 0)
+        self.assertEqual(padded["filtered"], 3)
+        self.assertEqual([r["name"] for r in falsy["records"]], ["maya"])
+
+    def test_filter_in_jsonl_with_filter_eq_applies_and(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": 3, "active": true}\n'
+                '{"name": "b", "orders": 3, "active": false}\n'
+                '{"name": "c", "orders": 4, "active": true}\n'
+                '{"name": "d", "orders": 3, "active": true}\n')
+            result = normalize_jsonl(path, self.schema,
+                                     filter_eq={"field": "active", "value": True},
+                                     filter_in={"field": "orders", "values": [3]})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]), (2, 2, 0))
+        self.assertEqual([r["name"] for r in result["records"]], ["a", "d"])
+
+    def test_filter_in_jsonl_disabled_structure_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(directory, '{"name": "a", "orders": 1, "active": true}\n')
+            omitted = normalize_jsonl(path, self.schema)
+            explicit_none = normalize_jsonl(path, self.schema, filter_in=None)
+        self.assertEqual(omitted, explicit_none)
+        self.assertEqual(set(omitted), {"records", "errors", "accepted", "rejected"})
+
+    def test_filter_in_jsonl_invalid_config_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.jsonl"
+        cases = [
+            [], "x", 3, False,
+            {"field": "active"},
+            {"values": [True]},
+            {},
+            {"field": "active", "values": [True], "extra": 1},
+            {"field": None, "values": [True]},
+            {"field": "   ", "values": [True]},
+            {"field": "nope", "values": [True]},
+            {"field": "active", "values": []},
+            {"field": "active", "values": "true"},
+            {"field": "active", "values": [0]},
+            {"field": "orders", "values": [False]},
+            {"field": "orders", "values": [1.5]},
+            {"field": "orders", "values": ["1"]},
+            {"field": "name", "values": [0]},
+            {"field": "name", "values": ["a", "a"]},
+            {"field": "orders", "values": [3, 3]},
+            {"field": "active", "values": [False, False]},
+            {"field": "orders", "values": [None, None]},
+        ]
+        for condition in cases:
+            with self.assertRaises(ValueError) as caught:
+                normalize_jsonl(missing, self.schema, filter_in=condition)
+            self.assertIn("filter_in", str(caught.exception))
+
+    def test_cli_filter_in_jsonl_flag(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory,
+                '{"name": "a", "orders": 3, "active": true}\n'
+                '{"name": "b", "orders": 4, "active": true}\n'
+                '{"name": "c", "orders": null, "active": true}\n'
+                '{"name": "d", "orders": 3, "active": false}\n'
+                '{"name": "e", "orders": "x", "active": true}\n',
+                name="source.jsonl")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            run = run_cli(path, output, errors, fmt="jsonl",
+                          extra=("--filter-in", json.dumps({"field": "orders", "values": [3, None]})))
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout),
+                             {"accepted": 3, "rejected": 1, "filtered": 1})
+            self.assertEqual(len(output.read_text().splitlines()), 3)
+            self.assertEqual(len(errors.read_text().splitlines()), 1)
+
+    def test_cli_filter_in_jsonl_bad_condition_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = self.write_jsonl(
+                directory, '{"name": "a", "orders": 3, "active": true}\n',
+                name="source.jsonl")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            for condition in ("{bad json", "[1, 2]",
+                              json.dumps({"field": "orders"}),
+                              json.dumps({"field": "orders", "values": [None, None]})):
+                if output.exists():
+                    output.unlink()
+                output.write_text("keep me\n", encoding="utf-8")
+                self.assertFalse(errors.exists())
+                run = run_cli(path, output, errors, fmt="jsonl",
+                              extra=("--filter-in", condition))
+                self.assertEqual(run.returncode, 2, condition)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("filter_in", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
 
     def test_default_fills_null_and_empty_string_jsonl(self):
         schema = {"columns": [
