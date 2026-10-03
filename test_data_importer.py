@@ -6693,5 +6693,285 @@ class ThousandsSeparatorTests(unittest.TestCase):
                              'orders\n1234\n1234\n-1000\n""\n')
 
 
+class MissingReportTests(unittest.TestCase):
+    """Optional per-column missing/defaulted/null report over kept records."""
+
+    def schema(self, with_default=True):
+        column = {"name": "orders", "type": "integer", "missing_values": ["N/A"]}
+        if with_default:
+            column["default"] = 0
+        return {"columns": [column]}
+
+    def write_inputs(self, directory):
+        # An empty value, a marker, a literal 0 and an unconvertible value.
+        csv_path = Path(directory) / "data.csv"
+        csv_path.write_text('orders\n""\nN/A\n0\nbad\n', encoding="utf-8")
+        jsonl_path = Path(directory) / "data.jsonl"
+        jsonl_path.write_text(
+            '{"orders": null}\n{"orders": "N/A"}\n{"orders": 0}\n'
+            '{"orders": "bad"}\n', encoding="utf-8")
+        return (("csv", csv_path), ("jsonl", jsonl_path))
+
+    def orders_entry(self, result):
+        entries = result["missing_report"]
+        self.assertEqual([entry["field"] for entry in entries], ["orders"])
+        return entries[0]
+
+    def test_fixed_sample_counts_defaulted(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_inputs(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(), report_missing=True)
+                self.assertEqual(result["records"], [{"orders": 0}] * 3)
+                self.assertEqual((result["accepted"], result["rejected"]), (3, 1))
+                entry = self.orders_entry(result)
+                self.assertEqual(
+                    (entry["missing"], entry["defaulted"], entry["null"]), (2, 2, 0))
+
+    def test_dedup_counts_only_the_kept_first_record(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_inputs(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(),
+                                   deduplicate_by=["orders"], report_missing=True)
+                self.assertEqual(result["records"], [{"orders": 0}])
+                self.assertEqual((result["accepted"], result["deduplicated"]), (1, 2))
+                entry = self.orders_entry(result)
+                self.assertEqual(
+                    (entry["missing"], entry["defaulted"], entry["null"]), (1, 1, 0))
+
+    def test_without_default_the_two_gaps_stay_null(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_inputs(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(with_default=False),
+                                   report_missing=True)
+                self.assertEqual(
+                    result["records"],
+                    [{"orders": None}, {"orders": None}, {"orders": 0}])
+                entry = self.orders_entry(result)
+                self.assertEqual(
+                    (entry["missing"], entry["defaulted"], entry["null"]), (2, 0, 2))
+
+    def test_zero_records_still_lists_every_field_with_zeros(self):
+        schema = {"columns": [
+            {"name": "code", "type": "string"},
+            {"name": "orders", "type": "integer",
+             "source": "purchase_count", "default": 0},
+            {"name": "active", "type": "boolean"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = Path(directory) / "empty.csv"
+            csv_path.write_text("code,purchase_count,active\n", encoding="utf-8")
+            jsonl_path = Path(directory) / "empty.jsonl"
+            jsonl_path.write_text("", encoding="utf-8")
+            for normalize, path in ((normalize_csv, csv_path),
+                                   (normalize_jsonl, jsonl_path)):
+                result = normalize(path, schema, report_missing=True)
+                self.assertEqual(result["records"], [])
+                self.assertEqual(result["missing_report"], [
+                    {"field": "code", "missing": 0, "defaulted": 0, "null": 0},
+                    {"field": "orders", "missing": 0, "defaulted": 0, "null": 0},
+                    {"field": "active", "missing": 0, "defaulted": 0, "null": 0}])
+
+    def test_missing_sources_and_nfkc_blank(self):
+        schema = {"columns": [
+            {"name": "s", "type": "string"},
+            {"name": "n", "type": "string", "unicode_normalization": "NFKC"},
+            {"name": "j", "type": "integer", "missing_values": ["N/A"]}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = Path(directory) / "data.csv"
+            csv_path.write_text("s,n,j\n  ,　,N/A\n", encoding="utf-8")
+            result = normalize_csv(csv_path, schema, report_missing=True)
+            jsonl_path = Path(directory) / "data.jsonl"
+            jsonl_path.write_text(
+                '{"s": "  ", "n": "　", "j": "N/A"}\n', encoding="utf-8")
+            jsonl_result = normalize_jsonl(
+                jsonl_path, schema, report_missing=True)
+            # the same three gaps are counted either way: trimmed text, a
+            # non-empty string NFKC collapses to blank, and a marker hit
+            for outcome in (result, jsonl_result):
+                self.assertEqual(outcome["missing_report"], [
+                    {"field": "s", "missing": 1, "defaulted": 0, "null": 1},
+                    {"field": "n", "missing": 1, "defaulted": 0, "null": 1},
+                    {"field": "j", "missing": 1, "defaulted": 0, "null": 1}])
+
+    def test_json_null_and_empty_string_are_both_missing(self):
+        schema = {"columns": [{"name": "orders", "type": "integer"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "data.jsonl"
+            path.write_text('{"orders": null}\n{"orders": "  "}\n',
+                            encoding="utf-8")
+            result = normalize_jsonl(path, schema, report_missing=True)
+        self.assertEqual(result["records"], [{"orders": None}, {"orders": None}])
+        self.assertEqual(self.orders_entry(result),
+                         {"field": "orders", "missing": 2, "defaulted": 0,
+                          "null": 2})
+
+    def test_input_equal_to_default_is_not_defaulted(self):
+        schema = {"columns": [
+            {"name": "g", "type": "string", "default": "N/A",
+             "value_map": {"x": "N/A"}}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "data.jsonl"
+            # a literal spelling of the default, a map hit onto that
+            # spelling, and a genuine null filled from the default
+            path.write_text('{"g": "N/A"}\n{"g": "x"}\n{"g": null}\n',
+                            encoding="utf-8")
+            result = normalize_jsonl(path, schema, report_missing=True)
+        self.assertEqual(result["records"], [{"g": "N/A"}] * 3)
+        self.assertEqual(result["missing_report"], [
+            {"field": "g", "missing": 1, "defaulted": 1, "null": 0}])
+
+    def test_error_filter_and_dedup_removed_rows_are_excluded(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_inputs(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                filtered = normalize(
+                    path, self.schema(),
+                    filter_eq={"field": "orders", "value": 99},
+                    report_missing=True)
+                self.assertEqual(filtered["records"], [])
+                self.assertEqual(filtered["filtered"], 3)
+                entry = self.orders_entry(filtered)
+                self.assertEqual(
+                    (entry["missing"], entry["defaulted"], entry["null"]),
+                    (0, 0, 0))
+                # the rejected "bad" row never contributes either
+                self.assertEqual(filtered["rejected"], 1)
+
+    def test_dedup_provenance_follows_the_record_actually_kept(self):
+        schema = {"columns": [
+            {"name": "k", "type": "string",
+             "unicode_normalization": "NFKC", "default": "-"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            # a gap NFKC collapses to blank (defaulted) then a literal "-"
+            gap_first = Path(directory) / "gap_first.jsonl"
+            gap_first.write_text('{"k": "　"}\n{"k": "-"}\n', encoding="utf-8")
+            literal_first = Path(directory) / "literal_first.jsonl"
+            literal_first.write_text('{"k": "-"}\n{"k": "　"}\n',
+                                     encoding="utf-8")
+            first = normalize_jsonl(gap_first, schema,
+                                    deduplicate_by=["k"], report_missing=True)
+            second = normalize_jsonl(literal_first, schema,
+                                     deduplicate_by=["k"], report_missing=True)
+        self.assertEqual(first["records"], [{"k": "-"}])
+        self.assertEqual(first["missing_report"], [
+            {"field": "k", "missing": 1, "defaulted": 1, "null": 0}])
+        self.assertEqual(second["records"], [{"k": "-"}])
+        self.assertEqual(second["missing_report"], [
+            {"field": "k", "missing": 0, "defaulted": 0, "null": 0}])
+
+    def test_blank_lines_are_not_counted(self):
+        schema = {"columns": [{"name": "orders", "type": "integer"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = Path(directory) / "data.csv"
+            csv_path.write_text('orders\n\n""\n""\n', encoding="utf-8")
+            result = normalize_csv(csv_path, schema, report_missing=True)
+            # only the quoted empty cells are records; the bare blank line skips
+        self.assertEqual(result["records"],
+                         [{"orders": None}, {"orders": None}])
+        self.assertEqual(self.orders_entry(result),
+                         {"field": "orders", "missing": 2, "defaulted": 0,
+                          "null": 2})
+
+    def test_disabled_result_structure_and_records_are_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_inputs(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema())
+                self.assertNotIn("missing_report", result)
+                self.assertNotIn("_missing", result["records"][0])
+                self.assertEqual(set(result),
+                                 {"records", "errors", "accepted", "rejected"})
+                # the default still applies exactly as before
+                self.assertEqual(result["records"], [{"orders": 0}] * 3)
+
+    def test_non_boolean_value_raises_after_config_checks_before_read(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        for bad in ("true", 1, 0, None, ["x"], {"on": True}):
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, self.schema(), report_missing=bad)
+                message = str(caught.exception)
+                self.assertIn("report_missing", message)
+                self.assertIn(repr(bad), message)
+        # an existing configuration problem is still reported first
+        bad_schema = {"columns": [{"name": "orders", "type": "date"}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, bad_schema, report_missing="x")
+        self.assertNotIn("report_missing", str(caught.exception))
+
+    def test_report_missing_is_keyword_only(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            _, path = self.write_inputs(directory)[0]
+            with self.assertRaises(TypeError):
+                normalize_csv(path, self.schema(), None, None, None, None,
+                              None, True)
+
+    def test_schema_is_not_mutated(self):
+        import copy
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_inputs(directory):
+                schema = self.schema()
+                snapshot = copy.deepcopy(schema)
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                normalize(path, schema, report_missing=True)
+                self.assertEqual(schema, snapshot)
+
+    def test_cli_flag_adds_report_to_summary_only(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(self.schema()), encoding="utf-8")
+            _, csv_path = self.write_inputs(directory)[0]
+            output = Path(directory) / "out.jsonl"
+            errors = Path(directory) / "errors.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"),
+                       str(csv_path), "--schema", str(schema_path),
+                       "--output", str(output), "--errors", str(errors),
+                       "--report-missing", "--deduplicate-by", "orders"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            summary = json.loads(run.stdout)
+            self.assertEqual(summary["missing_report"], [
+                {"field": "orders", "missing": 1, "defaulted": 1, "null": 0}])
+            # the report never enters either export
+            records = [json.loads(line)
+                       for line in output.read_text(encoding="utf-8")
+                      .splitlines()]
+            self.assertEqual(records, [{"orders": 0}])
+            exported_errors = [json.loads(line)
+                               for line in errors.read_text(encoding="utf-8")
+                              .splitlines()]
+            self.assertEqual(len(exported_errors), 1)
+            self.assertNotIn("missing_report", exported_errors[0])
+            # without the flag the summary and outputs stay exactly as before
+            command = command[:-3]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            summary = json.loads(run.stdout)
+            self.assertNotIn("missing_report", summary)
+
+    def test_cli_failure_still_exit_two_with_error_only(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = Path(directory) / "data.csv"
+            source.write_text("orders\n1\n", encoding="utf-8")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps({"columns": [
+                {"name": "orders", "type": "integer", "default": 0}]}),
+                encoding="utf-8")
+            output = Path(directory) / "out.jsonl"
+            errors = Path(directory) / "errors.jsonl"
+            # output-format invalid: report_missing can't change the failure
+            command = [sys.executable, str(ROOT / "data_importer.py"),
+                       str(source), "--schema", str(schema_path),
+                       "--output", str(output), "--errors", str(errors),
+                       "--output-format", "xml", "--report-missing"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertEqual(set(json.loads(run.stdout)), {"error"})
+            self.assertFalse(output.exists())
+            self.assertFalse(errors.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
