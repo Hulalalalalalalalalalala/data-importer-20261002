@@ -6375,5 +6375,323 @@ class CollapseWhitespaceTests(unittest.TestCase):
                              "code\nA B\nA B\nA B\n")
 
 
+class ThousandsSeparatorTests(unittest.TestCase):
+    """Optional comma thousands-grouping text conversion for ``integer`` columns."""
+
+    def schema(self, **overrides):
+        column = {"name": "orders", "type": "integer", "thousands_separator": ","}
+        column.update(overrides)
+        return {"columns": [column]}
+
+    def write_csv(self, directory, text):
+        path = Path(directory) / "data.csv"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_jsonl(self, directory, values, key="orders"):
+        path = Path(directory) / "data.jsonl"
+        path.write_text("".join(json.dumps({key: value}, ensure_ascii=False) + "\n"
+                                for value in values), encoding="utf-8")
+        return path
+
+    def write_sample_pair(self, directory):
+        # "1,234", "1234", "-1,000", "12,34" (rejected) and an empty value
+        # (a quoted empty CSV cell, JSON null) -> 1234, 1234, -1000, null.
+        csv_path = self.write_csv(
+            directory, 'orders\n"1,234"\n1234\n"-1,000"\n"12,34"\n""\n')
+        jsonl_path = self.write_jsonl(
+            directory, ["1,234", "1234", "-1,000", "12,34", None])
+        return (("csv", csv_path), ("jsonl", jsonl_path))
+
+    def test_fixed_sample_csv_and_jsonl(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema())
+                self.assertEqual(result["records"], [
+                    {"orders": 1234}, {"orders": 1234},
+                    {"orders": -1000}, {"orders": None}])
+                self.assertEqual((result["accepted"], result["rejected"]), (4, 1))
+                self.assertEqual(len(result["errors"]), 1)
+                # the header is line 1 for CSV; the bad text is the 4th record
+                self.assertEqual(result["errors"][0]["row"], 5 if fmt == "csv" else 4)
+                self.assertEqual(len(result["errors"][0]["errors"]), 1)
+                message = result["errors"][0]["errors"][0]
+                self.assertIn("orders", message)
+                self.assertIn("thousands_separator", message)
+                self.assertIn("'12,34'", message)
+
+    def test_duplicate_report_groups_only_valid_records(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(), duplicate_by=["orders"])
+                self.assertEqual(result["duplicates"], [
+                    {"key": {"orders": 1234}, "record_numbers": [1, 2]},
+                ])
+
+    def test_filter_eq_sees_the_converted_integer(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(),
+                                   filter_eq={"field": "orders", "value": 1234})
+                self.assertEqual(result["records"], [{"orders": 1234}] * 2)
+                self.assertEqual((result["accepted"], result["filtered"],
+                                  result["rejected"]), (2, 2, 1))
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertIn("thousands_separator", result["errors"][0]["errors"][0])
+
+    def test_dedup_keeps_first_of_equal_group(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(), deduplicate_by=["orders"])
+                self.assertEqual(result["records"], [
+                    {"orders": 1234}, {"orders": -1000}, {"orders": None}])
+                self.assertEqual((result["accepted"], result["deduplicated"],
+                                  result["rejected"]), (3, 1, 1))
+
+    def test_sign_and_leading_zeros(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory, 'orders\n"+001,234"\n"-1,000"\n"0,000"\n"00,001,002"\n')
+            result = normalize_csv(csv_path, self.schema())
+            jsonl_path = self.write_jsonl(
+                directory, ["+001,234", "-1,000", "0,000", "00,001,002"])
+            jsonl_result = normalize_jsonl(jsonl_path, self.schema())
+        expected = [{"orders": 1234}, {"orders": -1000},
+                    {"orders": 0}, {"orders": 1002}]
+        self.assertEqual(result["records"], expected)
+        self.assertEqual(result["rejected"], 0)
+        self.assertEqual(jsonl_result["records"], expected)
+        self.assertEqual(jsonl_result["rejected"], 0)
+
+    def test_rejected_groupings(self):
+        bad = ["12,34", "1,23,456", "1234,567", "1,2345", "1, 234", "1 ,234",
+               "1.234,5", "1_234,5", "１,２３４", "+,234", "1,", ",123",
+               "1,,234", "1,234.0", "١,٢٣٤"]
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory, "orders\n" + "\n".join(f'"{text}"' for text in bad) + "\n")
+            result = normalize_csv(csv_path, self.schema())
+            jsonl_path = self.write_jsonl(directory, bad)
+            jsonl_result = normalize_jsonl(jsonl_path, self.schema())
+        for outcome in (result, jsonl_result):
+            self.assertEqual(outcome["records"], [])
+            self.assertEqual(outcome["rejected"], len(bad))
+            for row, text in zip(outcome["errors"], bad):
+                self.assertEqual(len(row["errors"]), 1)
+                self.assertIn("thousands_separator", row["errors"][0])
+                self.assertIn(repr(text.strip()), row["errors"][0])
+
+    def test_text_without_comma_keeps_old_rules(self):
+        # no comma: the plain int() rule still applies, underscores included
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "orders\n1234\n1_000\n+12\nbad\n")
+            result = normalize_csv(csv_path, self.schema())
+            jsonl_path = self.write_jsonl(directory, ["1234", "1_000", "+12", "bad"])
+            jsonl_result = normalize_jsonl(jsonl_path, self.schema())
+        self.assertEqual(result["records"],
+                         [{"orders": 1234}, {"orders": 1000}, {"orders": 12}])
+        self.assertEqual(result["rejected"], 1)
+        self.assertNotIn("thousands_separator", result["errors"][0]["errors"][0])
+        self.assertEqual(jsonl_result["records"], result["records"])
+        self.assertEqual(jsonl_result["rejected"], 1)
+        self.assertEqual(jsonl_result["errors"][0]["errors"],
+                         ["orders: expected integer"])
+
+    def test_jsonl_native_integer_and_other_values(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "data.jsonl"
+            path.write_text('{"orders": 1234}\n{"orders": true}\n'
+                            '{"orders": [1]}\n{"orders": 1.5}\n', encoding="utf-8")
+            result = normalize_jsonl(path, self.schema())
+        self.assertEqual(result["records"], [{"orders": 1234}])
+        self.assertEqual(result["rejected"], 3)
+        self.assertTrue(all(row["errors"] == ["orders: expected integer"]
+                            for row in result["errors"]))
+
+    def test_default_still_requires_a_native_integer(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = self.schema(default="1,234")
+        for normalize in (normalize_csv, normalize_jsonl):
+            with self.assertRaises(ValueError) as caught:
+                normalize(missing, schema)
+            self.assertIn("default", str(caught.exception))
+        # a native integer default fills empty values as before
+        schema = self.schema(default=1000)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'orders\n""\n"2,000"\n')
+            result = normalize_csv(csv_path, schema)
+            jsonl_path = self.write_jsonl(directory, [None, "2,000"])
+            jsonl_result = normalize_jsonl(jsonl_path, schema)
+        self.assertEqual(result["records"], [{"orders": 1000}, {"orders": 2000}])
+        self.assertEqual(jsonl_result["records"], result["records"])
+
+    def test_missing_values_and_required_flow_unchanged(self):
+        schema = self.schema(missing_values=["N/A"], default=1000)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'orders\nN/A\n""\n"1,234"\n')
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"],
+                         [{"orders": 1000}, {"orders": 1000}, {"orders": 1234}])
+        schema = self.schema(required=True)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'orders\n""\n')
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["rejected"], 1)
+        self.assertIn("required value is empty", result["errors"][0]["errors"][0])
+
+    def test_enum_range_and_lte_see_the_final_integer(self):
+        schema = self.schema(allowed_values=[1234, -1000, 2500], minimum=-2000,
+                             maximum=2000)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory, 'orders\n"1,234"\n"-1,000"\n"2,500"\n"3,000"\n')
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"orders": 1234}, {"orders": -1000}])
+        self.assertEqual(result["rejected"], 2)
+        self.assertIn("maximum", result["errors"][0]["errors"][0])
+        self.assertIn("allowed_values", result["errors"][1]["errors"][0])
+        schema = {"columns": [
+            {"name": "lo", "type": "integer", "thousands_separator": ",",
+             "lte_field": "hi"},
+            {"name": "hi", "type": "integer", "thousands_separator": ","}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory, 'lo,hi\n"1,000","2,000"\n"3,000","2,000"\n')
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"lo": 1000, "hi": 2000}])
+        self.assertEqual(result["rejected"], 1)
+        self.assertIn("lte_field", result["errors"][0]["errors"][0])
+
+    def test_csv_comma_cells_must_stay_quoted(self):
+        # an unquoted 1,234 is two cells, not a grouped integer
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "orders\n1,234\n")
+            result = normalize_csv(csv_path, self.schema())
+        self.assertEqual(result["records"], [])
+        self.assertEqual(result["rejected"], 1)
+        self.assertEqual(result["errors"][0]["errors"], ["wrong number of cells"])
+
+    def test_invalid_attribute_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        bad_values = ["", " ", "，", ";", ".", "comma", True, 1, None, [","]]
+        for value in bad_values:
+            schema = {"columns": [{"name": "f", "type": "integer",
+                                   "thousands_separator": value}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("thousands_separator", message, value)
+                self.assertIn("f", message, value)
+                self.assertIn(repr(value), message, value)
+        for kind in ("string", "boolean"):
+            schema = {"columns": [{"name": "f", "type": kind,
+                                   "thousands_separator": ","}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("thousands_separator", message)
+                self.assertIn("f", message)
+                self.assertIn("','", message)
+
+    def test_structure_check_still_runs_first(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [{"name": "f", "type": "nope",
+                               "thousands_separator": "x"}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        message = str(caught.exception)
+        self.assertIn("schema", message)
+        self.assertNotIn("thousands_separator", message)
+
+    def test_schema_dict_is_never_mutated(self):
+        import copy
+        schema = self.schema(default=1000, allowed_values=[1000, 1234])
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                normalize(path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_undeclared_attribute_keeps_old_behavior(self):
+        schema = {"columns": [{"name": "orders", "type": "integer"}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'orders\n"1,234"\n1234\n')
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"orders": 1234}])
+        self.assertEqual(result["rejected"], 1)
+        self.assertNotIn("thousands_separator", result["errors"][0]["errors"][0])
+
+    def test_cli_bad_attribute_exit_two_keeps_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_csv(directory, "orders\n1\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(
+                {"columns": [{"name": "orders", "type": "integer",
+                              "thousands_separator": "，"}]}),
+                encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("thousands_separator", payload["error"])
+            self.assertIn("orders", payload["error"])
+            self.assertIn("，", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+    def test_cli_converts_and_exports_both_input_formats(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(
+                json.dumps(self.schema(), ensure_ascii=False), encoding="utf-8")
+            for fmt, source in self.write_sample_pair(directory):
+                output = Path(directory) / f"out-{fmt}.jsonl"
+                errors = Path(directory) / f"err-{fmt}.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"),
+                           str(source), "--schema", str(schema_path),
+                           "--output", str(output), "--errors", str(errors),
+                           "--format", fmt, "--duplicate-by", "orders"]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                summary = json.loads(run.stdout)
+                self.assertEqual(summary["accepted"], 4)
+                self.assertEqual(summary["rejected"], 1)
+                self.assertEqual(summary["duplicates"], [
+                    {"key": {"orders": 1234}, "record_numbers": [1, 2]}])
+                records = [json.loads(line)
+                           for line in output.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(records, [
+                    {"orders": 1234}, {"orders": 1234},
+                    {"orders": -1000}, {"orders": None}])
+                error_rows = [json.loads(line)
+                              for line in errors.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(error_rows), 1)
+                self.assertIn("thousands_separator", error_rows[0]["errors"][0])
+            # the CSV records export writes plain decimal text, never grouped
+            output = Path(directory) / "out.csv"
+            errors = Path(directory) / "err.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"),
+                       str(self.write_sample_pair(directory)[0][1]),
+                       "--schema", str(schema_path),
+                       "--output", str(output), "--errors", str(errors),
+                       "--format", "csv", "--output-format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"),
+                             'orders\n1234\n1234\n-1000\n""\n')
+
+
 if __name__ == "__main__":
     unittest.main()
