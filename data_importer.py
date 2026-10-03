@@ -804,6 +804,68 @@ def _prepare_filter_in(filter_in, columns):
     return field, checked
 
 
+def _prepare_filter_range(filter_range, columns):
+    """Validate the optional single-field inclusive integer range filter.
+
+    The condition is an object holding ``field`` plus at least one of
+    ``minimum`` and ``maximum`` and no other keys; field matches an
+    ``integer`` column's output name literally (source aliases are not
+    recognized) and each declared bound must be a non-boolean integer
+    (negative values and zero are legal, kept verbatim -- never
+    converted). An undeclared end imposes no limit and equal ends keep
+    exactly that one integer. Returns (field, minimum, maximum) with
+    None for an undeclared end, or None when filtering is disabled.
+    Raises ValueError naming ``filter_range`` and the offending value
+    before the input is read; the caller's condition is never mutated.
+    """
+    if filter_range is None:
+        return None
+    if not isinstance(filter_range, dict):
+        raise ValueError(
+            f"filter_range {filter_range!r} must be an object with 'field' and "
+            "at least one of 'minimum' and 'maximum'")
+    keys = set(filter_range)
+    allowed_keys = {"field", "minimum", "maximum"}
+    if "field" not in keys or not keys <= allowed_keys or not keys & {"minimum", "maximum"}:
+        details = []
+        if "field" not in keys:
+            details.append("missing key(s): field")
+        extra = sorted(keys - allowed_keys)
+        if extra:
+            details.append("unexpected key(s): " + ", ".join(extra))
+        if not keys & {"minimum", "maximum"}:
+            details.append("at least one of 'minimum' and 'maximum' is required")
+        raise ValueError(
+            f"filter_range {filter_range!r} must contain 'field' and at least one of "
+            "'minimum' and 'maximum' (" + "; ".join(details) + ")")
+    field = filter_range["field"]
+    if not isinstance(field, str):
+        raise ValueError(f"filter_range field {field!r} must be a string")
+    if not field.strip():
+        raise ValueError(f"filter_range field {field!r} must be a non-blank string")
+    by_name = {column["name"]: column for column in columns}
+    if field not in by_name:
+        raise ValueError(f"filter_range field {field!r} is not a schema column name")
+    if by_name[field]["type"] != "integer":
+        raise ValueError(
+            f"filter_range field {field!r} must name an integer column")
+    bounds = {}
+    for attribute in ("minimum", "maximum"):
+        if attribute not in filter_range:
+            continue
+        bound = filter_range[attribute]
+        if isinstance(bound, bool) or not isinstance(bound, int):
+            raise ValueError(
+                f"filter_range {attribute} {bound!r} must be a non-boolean integer")
+        bounds[attribute] = bound
+    minimum = bounds.get("minimum")
+    maximum = bounds.get("maximum")
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError(
+            f"filter_range minimum {minimum!r} is greater than maximum {maximum!r}")
+    return field, minimum, maximum
+
+
 def _deduplicate_records(records, deduplicate_by):
     """Keep the first record of each equal-key group, in input order.
 
@@ -825,28 +887,43 @@ def _deduplicate_records(records, deduplicate_by):
 
 
 def _build_result(records, errors, duplicate_fields, filter_condition,
-                  deduplicate_fields=None, filter_in_condition=None):
+                  deduplicate_fields=None, filter_in_condition=None,
+                  filter_range_condition=None):
     """Filter fully validated records, then keep-first dedup, then counts.
 
-    Order is: validation (already done by the caller), ``filter_eq`` and
-    ``filter_in`` (a record survives only when every enabled predicate
-    matches, so the two combine as AND; ``filtered`` counts each removed
-    record once), keep-first deduplication over the filter survivors, and
-    finally the duplicate report over the records that remain.
+    Order is: validation (already done by the caller), ``filter_eq``,
+    ``filter_in`` and ``filter_range`` (a record survives only when every
+    enabled predicate matches, so the three combine as AND; ``filtered``
+    counts each removed record once), keep-first deduplication over the
+    filter survivors, and finally the duplicate report over the records
+    that remain.
     """
-    filtering = filter_condition is not None or filter_in_condition is not None
+    filtering = (filter_condition is not None or filter_in_condition is not None
+                 or filter_range_condition is not None)
     filtered_records = records
     if filtering:
         eq_field, eq_expected = (
             filter_condition if filter_condition is not None else (None, None))
         in_field, in_values = (
             filter_in_condition if filter_in_condition is not None else (None, None))
+        range_field, range_minimum, range_maximum = (
+            filter_range_condition if filter_range_condition is not None
+            else (None, None, None))
 
         def matches(record):
             if filter_condition is not None and record[eq_field] != eq_expected:
                 return False
             if filter_in_condition is not None and record[in_field] not in in_values:
                 return False
+            if filter_range_condition is not None:
+                # Null never matches an inclusive integer range.
+                value = record[range_field]
+                if value is None:
+                    return False
+                if range_minimum is not None and value < range_minimum:
+                    return False
+                if range_maximum is not None and value > range_maximum:
+                    return False
             return True
 
         filtered_records = [record for record in records if matches(record)]
@@ -913,7 +990,7 @@ def _nfkc(value):
 
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
-                  deduplicate_by=None, filter_in=None):
+                  deduplicate_by=None, filter_in=None, filter_range=None):
     columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
@@ -921,6 +998,7 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
     deduplicate_fields = _prepare_deduplicate_by(deduplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
     filter_in_condition = _prepare_filter_in(filter_in, columns)
+    filter_range_condition = _prepare_filter_range(filter_range, columns)
     records, errors = [], []
     # strict=True turns the two quote-syntax problems that a lenient reader
     # silently folds into the data into csv.Error: a quoted field still open
@@ -1055,7 +1133,8 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
         if header is None:
             raise ValueError("CSV header must match schema column sources and order exactly")
     return _build_result(records, errors, duplicate_fields, filter_condition,
-                         deduplicate_fields, filter_in_condition)
+                         deduplicate_fields, filter_in_condition,
+                         filter_range_condition)
 
 
 def _convert_jsonl_value(column, value, defaults, markers, aliases,
@@ -1119,7 +1198,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
-                    deduplicate_by=None, filter_in=None):
+                    deduplicate_by=None, filter_in=None, filter_range=None):
     columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
@@ -1127,6 +1206,7 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
     deduplicate_fields = _prepare_deduplicate_by(deduplicate_by, names)
     filter_condition = _prepare_filter_eq(filter_eq, columns)
     filter_in_condition = _prepare_filter_in(filter_in, columns)
+    filter_range_condition = _prepare_filter_range(filter_range, columns)
     expected = set(sources)
     records, errors = [], []
     decoded_pairs = []
@@ -1218,7 +1298,8 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
             else:
                 records.append(record)
     return _build_result(records, errors, duplicate_fields, filter_condition,
-                         deduplicate_fields, filter_in_condition)
+                         deduplicate_fields, filter_in_condition,
+                         filter_range_condition)
 
 
 def write_jsonl(path, records):
@@ -1479,6 +1560,8 @@ def main():
                         help='equality condition as JSON, e.g. {"field": "active", "value": true}')
     parser.add_argument("--filter-in", metavar="JSON",
                         help='set-membership condition as JSON, e.g. {"field": "orders", "values": [3, null]}')
+    parser.add_argument("--filter-range", metavar="JSON",
+                        help='inclusive integer range condition as JSON, e.g. {"field": "orders", "minimum": 3, "maximum": 5}')
     args = parser.parse_args()
     try:
         _check_path_isolation(args.source, args.schema, args.output, args.errors)
@@ -1506,11 +1589,22 @@ def main():
                 raise ValueError(f"filter_in is not valid JSON: {exc}") from None
             if not isinstance(filter_in, dict):
                 raise ValueError("filter_in must be a JSON object with 'field' and 'values' keys")
+        filter_range = None
+        if args.filter_range is not None:
+            try:
+                filter_range = json.loads(args.filter_range)
+            except ValueError as exc:
+                raise ValueError(f"filter_range is not valid JSON: {exc}") from None
+            if not isinstance(filter_range, dict):
+                raise ValueError(
+                    "filter_range must be a JSON object with 'field' and at least "
+                    "one of 'minimum' and 'maximum'")
         normalize = normalize_csv if args.format == "csv" else normalize_jsonl
         schema = json.loads(Path(args.schema).read_text(encoding="utf-8"))
         result = normalize(args.source, schema,
                            duplicate_by=args.duplicate_by, filter_eq=filter_eq,
-                           deduplicate_by=args.deduplicate_by, filter_in=filter_in)
+                           deduplicate_by=args.deduplicate_by, filter_in=filter_in,
+                           filter_range=filter_range)
         if args.output_format == "csv":
             names = [column["name"] for column in schema["columns"]]
             output_payload = _csv_payload(names, result["records"])
@@ -1520,7 +1614,8 @@ def main():
                 for record in result["records"])
         _write_outputs_atomic(args.output, output_payload, args.errors, result["errors"])
         summary = {"accepted": result["accepted"], "rejected": result["rejected"]}
-        if args.filter_eq is not None or args.filter_in is not None:
+        if (args.filter_eq is not None or args.filter_in is not None
+                or args.filter_range is not None):
             summary["filtered"] = result["filtered"]
         if args.deduplicate_by is not None:
             summary["deduplicated"] = result["deduplicated"]

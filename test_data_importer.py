@@ -707,6 +707,222 @@ class ImporterTests(unittest.TestCase):
                 self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
                 self.assertFalse(errors.exists())
 
+    def test_filter_range_inclusive_bounds_and_counts(self):
+        # Optional orders without a default: 3, "3", 5, 6, null, "bad" with
+        # range 3..5 keeps 3, 3, 5; 6 and null are filtered, "bad" rejected.
+        text = ("name,orders,active\n"
+                "a,3,true\n"
+                "b,3,true\n"
+                "c,5,true\n"
+                "d,6,true\n"
+                "e,,true\n"
+                "f,bad,true\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema,
+                                   filter_range={"field": "orders", "minimum": 3, "maximum": 5})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]),
+                         (3, 2, 1))
+        self.assertEqual([record["orders"] for record in result["records"]], [3, 3, 5])
+        self.assertEqual(result["errors"][0]["row"], 7)
+
+    def test_filter_range_jsonl_agrees_with_csv(self):
+        lines = ("\n".join([
+            '{"name": "a", "orders": 3, "active": true}',
+            '{"name": "b", "orders": "3", "active": true}',
+            '{"name": "c", "orders": 5, "active": true}',
+            '{"name": "d", "orders": 6, "active": true}',
+            '{"name": "e", "orders": null, "active": true}',
+            '{"name": "f", "orders": "bad", "active": true}',
+        ]) + "\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "data.jsonl"
+            path.write_text(lines, encoding="utf-8")
+            result = normalize_jsonl(path, self.schema,
+                                     filter_range={"field": "orders", "minimum": 3, "maximum": 5})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]),
+                         (3, 2, 1))
+        self.assertEqual([record["orders"] for record in result["records"]], [3, 3, 5])
+        self.assertEqual(result["errors"][0]["row"], 6)
+
+    def test_filter_range_single_ended_and_equal_bounds(self):
+        text = ("name,orders,active\n"
+                "a,-2,true\n"
+                "b,0,true\n"
+                "c,3,true\n"
+                "d,7,true\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            low = normalize_csv(csv_path, self.schema,
+                                filter_range={"field": "orders", "minimum": 0})
+            high = normalize_csv(csv_path, self.schema,
+                                 filter_range={"field": "orders", "maximum": 3})
+            exact = normalize_csv(csv_path, self.schema,
+                                  filter_range={"field": "orders", "minimum": 3, "maximum": 3})
+        self.assertEqual([r["name"] for r in low["records"]], ["b", "c", "d"])
+        self.assertEqual(low["filtered"], 1)
+        self.assertEqual([r["name"] for r in high["records"]], ["a", "b", "c"])
+        self.assertEqual(high["filtered"], 1)
+        self.assertEqual([r["name"] for r in exact["records"]], ["c"])
+        self.assertEqual(exact["filtered"], 3)
+
+    def test_filter_range_sees_defaults_and_null_never_matches(self):
+        schema = {"columns": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "orders", "type": "integer", "default": 4},
+            {"name": "other", "type": "integer"},
+        ]}
+        text = ("name,orders,other\n"
+                "a,,2\n"     # orders filled with default 4, in range
+                "b,4,\n"     # other is null: filtered out by the other range
+                "c,9,5\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            by_orders = normalize_csv(csv_path, schema,
+                                      filter_range={"field": "orders", "minimum": 3, "maximum": 5})
+            by_other = normalize_csv(csv_path, schema,
+                                     filter_range={"field": "other", "minimum": 0})
+        self.assertEqual([r["name"] for r in by_orders["records"]], ["a", "b"])
+        self.assertEqual(by_orders["filtered"], 1)
+        self.assertEqual([r["name"] for r in by_other["records"]], ["a", "c"])
+        self.assertEqual(by_other["filtered"], 1)
+
+    def test_filter_range_combines_with_eq_and_in_as_and_count_once(self):
+        text = ("name,orders,active\n"
+                "a,3,true\n"
+                "b,4,true\n"
+                "c,3,false\n"
+                "d,9,false\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(
+                csv_path, self.schema,
+                filter_range={"field": "orders", "minimum": 3, "maximum": 5},
+                filter_in={"field": "orders", "values": [3, 4, 9]},
+                filter_eq={"field": "active", "value": True})
+        # a and b pass all three predicates; c fails filter_eq, d fails the
+        # range (and filter_eq): each removed record is counted once.
+        self.assertEqual([r["name"] for r in result["records"]], ["a", "b"])
+        self.assertEqual((result["accepted"], result["filtered"]), (2, 2))
+
+    def test_filter_range_then_deduplicate_and_duplicate_report(self):
+        text = ("name,orders,active\n"
+                "a,3,true\n"
+                "b,9,true\n"
+                "c,3,true\n"
+                "bad,x,true\n"
+                "d,4,true\n")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, text)
+            result = normalize_csv(csv_path, self.schema, duplicate_by=["orders"],
+                                   filter_range={"field": "orders", "maximum": 5})
+        self.assertEqual((result["accepted"], result["filtered"], result["rejected"]),
+                         (3, 1, 1))
+        self.assertEqual([r["name"] for r in result["records"]], ["a", "c", "d"])
+        self.assertEqual(result["duplicates"],
+                         [{"key": {"orders": 3}, "record_numbers": [1, 2]}])
+
+    def test_filter_range_disabled_or_none_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\na,1,true\nb,2,false\n")
+            omitted = normalize_csv(csv_path, self.schema)
+            explicit_none = normalize_csv(csv_path, self.schema, filter_range=None)
+        self.assertEqual(omitted, explicit_none)
+        self.assertEqual(set(omitted), {"records", "errors", "accepted", "rejected"})
+        self.assertNotIn("filtered", omitted)
+
+    def test_filter_range_invalid_config_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        cases = [
+            [], "x", 3, True,
+            {"minimum": 3},
+            {"field": "orders"},
+            {},
+            {"field": "orders", "minimum": 3, "extra": 1},
+            {"field": 1, "minimum": 3},
+            {"field": "  ", "minimum": 3},
+            {"field": "nope", "minimum": 3},
+            {"field": "name", "minimum": 3},
+            {"field": "active", "maximum": 3},
+            {"field": "orders", "minimum": True},
+            {"field": "orders", "maximum": False},
+            {"field": "orders", "minimum": 1.0},
+            {"field": "orders", "maximum": "5"},
+            {"field": "orders", "minimum": None},
+            {"field": "orders", "minimum": 5, "maximum": 3},
+        ]
+        for condition in cases:
+            snapshot = json.loads(json.dumps(condition))
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(missing, self.schema, filter_range=condition)
+            self.assertIn("filter_range", str(caught.exception), condition)
+            self.assertEqual(condition, snapshot)
+        # source aliases are not recognized as field names
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory, "display_name,purchase_count,active\nMaya,3,TRUE\n")
+            with self.assertRaises(ValueError) as caught:
+                normalize_csv(csv_path, self.mapped_schema(),
+                              filter_range={"field": "purchase_count", "minimum": 3})
+            self.assertIn("filter_range", str(caught.exception))
+
+    def test_cli_filter_range_flag(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(
+                directory,
+                "name,orders,active\n"
+                "a,3,true\n"
+                "b,5,true\n"
+                "c,6,true\n"
+                "d,bad,true\n")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            run = run_cli(csv_path, output, errors, extra=(
+                "--filter-range", json.dumps({"field": "orders", "minimum": 3, "maximum": 5})))
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertEqual(json.loads(run.stdout),
+                             {"accepted": 2, "rejected": 1, "filtered": 1})
+            self.assertEqual(len(output.read_text().splitlines()), 2)
+            self.assertEqual(len(errors.read_text().splitlines()), 1)
+
+    def test_cli_filter_range_all_filtered_empty_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\na,1,true\nb,2,true\n")
+            jsonl_out, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            condition = json.dumps({"field": "orders", "minimum": 10})
+            run = run_cli(csv_path, jsonl_out, errors, extra=("--filter-range", condition))
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout),
+                             {"accepted": 0, "rejected": 0, "filtered": 2})
+            self.assertEqual(jsonl_out.read_text(encoding="utf-8"), "")
+            csv_out = Path(directory) / "records.csv"
+            run = run_cli(csv_path, csv_out, errors,
+                          extra=("--filter-range", condition), output_format="csv")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(csv_out.read_text(encoding="utf-8"), "name,orders,active\n")
+
+    def test_cli_filter_range_bad_condition_exit_two_keeps_files(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "name,orders,active\nA,3,TRUE\n")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            for condition in ("{bad json", "[1, 2]",
+                              json.dumps({"field": "orders"}),
+                              json.dumps({"field": "nope", "minimum": 1}),
+                              json.dumps({"field": "name", "minimum": 1}),
+                              json.dumps({"field": "orders", "minimum": True}),
+                              json.dumps({"field": "orders", "minimum": 5, "maximum": 3})):
+                if output.exists():
+                    output.unlink()
+                output.write_text("keep me\n", encoding="utf-8")
+                self.assertFalse(errors.exists())
+                run = run_cli(csv_path, output, errors, extra=("--filter-range", condition))
+                self.assertEqual(run.returncode, 2, condition)
+                payload = json.loads(run.stdout)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].strip())
+                self.assertIn("filter_range", payload["error"])
+                self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+                self.assertFalse(errors.exists())
+
     def test_default_fills_empty_for_optional_and_required_csv(self):
         schema = {"columns": [
             {"name": "name", "type": "string", "required": True, "default": "  Nobody "},
