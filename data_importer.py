@@ -558,6 +558,35 @@ def _prepare_required_when(columns):
     return required_when
 
 
+def _prepare_thousands_separator(columns):
+    """Validate the optional per-column ``thousands_separator`` attribute.
+
+    Returns the set of output field names that opt in. The attribute may
+    appear only on ``integer`` columns and its value must be the exact
+    string ``","``: any other value (a different separator spelling or a
+    non-string) or a declaration on a ``string`` or ``boolean`` column is
+    a configuration error. Raises ValueError naming
+    ``thousands_separator``, the output field and the offending value
+    before the input is read; the caller's schema is never mutated.
+    """
+    grouping = set()
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "thousands_separator" not in column:
+            continue
+        separator = column["thousands_separator"]
+        if not isinstance(separator, str) or separator != ",":
+            raise ValueError(
+                f"column {name!r} thousands_separator {separator!r} must be the "
+                "exact string ','")
+        if kind != "integer":
+            raise ValueError(
+                f"column {name!r} thousands_separator {separator!r} "
+                "requires an integer column")
+        grouping.add(name)
+    return grouping
+
+
 def _prepare_patterns(columns, defaults, value_maps=frozenset()):
     """Validate the optional ``pattern`` regular expression of each column.
 
@@ -781,7 +810,10 @@ def _prepare_schema(schema):
     # pre-existing configuration check (structure, per-column attributes
     # and sources) has passed.
     required_when = _prepare_required_when(columns)
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps, collapsing
+    # The thousands_separator declarations are likewise validated only
+    # after every pre-existing configuration check has passed.
+    grouping = _prepare_thousands_separator(columns)
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps, collapsing, grouping
 
 
 def _prepare_field_list(fields, names, option):
@@ -1161,9 +1193,39 @@ def _collapse_ws(value):
     return " ".join(value.split())
 
 
+# Comma-grouped integer text under an opted-in ``thousands_separator``
+# column: an optional ASCII sign, a first group of one to three ASCII
+# digits (leading zeros allowed), then at least one comma followed by
+# exactly three ASCII digits, matching the whole trimmed text. Internal
+# whitespace, a decimal point, underscores and non-ASCII digits never
+# match.
+_GROUPED_INTEGER = re.compile(r"[+-]?[0-9]{1,3}(?:,[0-9]{3})+")
+
+
+def _convert_integer_text(value, name, grouping):
+    """Convert trimmed non-empty integer text for one column.
+
+    Text without a comma converts under the ordinary ``int()`` rule
+    exactly as before, whether or not the column opted into
+    ``thousands_separator``. Text with a comma on an opted-in column
+    must match the full grouping pattern (optional ASCII sign, a one- to
+    three-digit first group, then comma-separated three-digit groups);
+    the commas are then dropped and the remaining signed digits convert.
+    Any other comma-bearing text raises ValueError naming
+    ``thousands_separator`` and carrying the cleaned text verbatim; the
+    caller prefixes the output field name.
+    """
+    if name in grouping and "," in value:
+        if _GROUPED_INTEGER.fullmatch(value) is None:
+            raise ValueError(
+                f"invalid thousands_separator grouping: {value!r}")
+        return int(value.replace(",", ""))
+    return int(value)
+
+
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None, filter_in=None, filter_range=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps, collapsing = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps, collapsing, grouping = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1231,7 +1293,7 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                                 else:
                                     converted = None
                             elif kind == "integer":
-                                converted = int(value)
+                                converted = _convert_integer_text(value, name, grouping)
                             elif kind == "boolean":
                                 folded = value.casefold()
                                 if folded in ("true", "false"):
@@ -1327,7 +1389,7 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
 
 def _convert_jsonl_value(column, value, defaults, markers, aliases,
                          normalizing=frozenset(), collapsing=frozenset(),
-                         casefolding=frozenset()):
+                         casefolding=frozenset(), grouping=frozenset()):
     """Convert one decoded JSON value. Returns (converted, error_message)."""
     name, kind = column["name"], column["type"]
     if isinstance(value, str):
@@ -1374,6 +1436,11 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
         if isinstance(value, int):
             return value, None
         if isinstance(value, str):
+            if name in grouping and "," in value:
+                if _GROUPED_INTEGER.fullmatch(value) is None:
+                    return None, (f"{name}: invalid thousands_separator "
+                                  f"grouping: {value!r}")
+                return int(value.replace(",", "")), None
             try:
                 return int(value), None
             except ValueError:
@@ -1393,7 +1460,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None, filter_in=None, filter_range=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps, collapsing = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps, collapsing, grouping = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1455,7 +1522,7 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                 name = column["name"]
                 converted, message = _convert_jsonl_value(
                     column, obj[origin], defaults, markers, aliases, normalizing,
-                    collapsing, casefolding)
+                    collapsing, casefolding, grouping)
                 if message is not None:
                     slots[index].append(message)
                     field_error_names.add(name)
