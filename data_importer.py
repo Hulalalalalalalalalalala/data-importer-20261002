@@ -67,6 +67,106 @@ def _prepare_casefold(columns):
     return folding
 
 
+def _process_string_text(value, name, normalizing, casefolding):
+    """Finish a non-empty string value through trim, NFKC and casefold.
+
+    Runs the column's declared string normalizations in the established
+    order (the value arrives already trimmed): NFKC plus a second trim
+    when the column opts in, then case folding. Returns the processed
+    text; the empty-value flows (default, required, null) are handled by
+    the caller when NFKC collapses the text to blank.
+    """
+    if name in normalizing:
+        value = _nfkc(value)
+    if name in casefolding:
+        value = value.casefold()
+    return value
+
+
+def _prepare_value_maps(columns, normalizing, casefolding):
+    """Validate the optional per-column ``value_map`` attribute.
+
+    Returns a mapping of output field name to the processed entries as a
+    list of ``(processed_key, target)`` pairs kept in declared order. The
+    attribute is accepted only on ``string`` columns and must be a
+    non-empty object whose keys and mapped values are strings; declared
+    keys and targets are first trimmed, then run through the column's
+    existing string normalization in the same order an incoming string
+    gets (NFKC plus a second trim when enabled, then case folding). A key
+    that processes to blank, a non-string key or value, a declaration on
+    an ``integer`` or ``boolean`` column, or two keys that process to the
+    same text are configuration errors -- the latter even when both keys
+    map to the same target. Raises ValueError naming ``value_map``, the
+    output field and the offending value before the input is read; the
+    caller's schema dicts are never mutated.
+    """
+    maps = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "value_map" not in column:
+            continue
+        configured = column["value_map"]
+        if kind != "string":
+            raise ValueError(
+                f"column {name!r} value_map {configured!r} requires a string column")
+        if not isinstance(configured, dict) or not configured:
+            raise ValueError(
+                f"column {name!r} value_map {configured!r} must be a non-empty object")
+        entries = []
+        seen = set()
+        for key, target in configured.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"column {name!r} value_map key {key!r} must be a string")
+            if not isinstance(target, str):
+                raise ValueError(
+                    f"column {name!r} value_map value {target!r} for key {key!r} "
+                    "must be a string")
+            processed_key = key.strip()
+            if not processed_key:
+                raise ValueError(
+                    f"column {name!r} value_map key {key!r} must not be blank")
+            processed_target = target.strip()
+            if not processed_target:
+                raise ValueError(
+                    f"column {name!r} value_map value {target!r} for key {key!r} "
+                    "must not be blank")
+            processed_key = _process_string_text(
+                processed_key, name, normalizing, casefolding)
+            if not processed_key:
+                raise ValueError(
+                    f"column {name!r} value_map key {key!r} must not normalize to blank")
+            processed_target = _process_string_text(
+                processed_target, name, normalizing, casefolding)
+            if not processed_target:
+                raise ValueError(
+                    f"column {name!r} value_map value {target!r} for key {key!r} "
+                    "must not normalize to blank")
+            if processed_key in seen:
+                raise ValueError(
+                    f"column {name!r} value_map key {key!r} normalizes to a repeated "
+                    f"key {processed_key!r}")
+            seen.add(processed_key)
+            entries.append((processed_key, processed_target))
+        maps[name] = entries
+    return maps
+
+
+def _mapped_string(value, entries):
+    """Look a normalized string up in a processed ``value_map`` exactly once.
+
+    The match is exact against the processed keys, in declared order
+    (the first duplicate key cannot survive preparation); a hit returns
+    the processed target and a miss returns the value unchanged. The
+    result is never matched against the map again, so a target spelling
+    that also appears as a key is not chained.
+    """
+    for processed_key, processed_target in entries:
+        if value == processed_key:
+            return processed_target
+    return value
+
+
 def _prepare_defaults(columns, normalizing=frozenset(), casefolding=frozenset()):
     """Validate the optional target-typed ``default`` of each column.
 
@@ -126,7 +226,7 @@ def _enum_field_error(name, value, allowed):
     return None
 
 
-def _prepare_allowed_values(columns, defaults):
+def _prepare_allowed_values(columns, defaults, value_maps=frozenset()):
     """Validate the optional ``allowed_values`` list of each column.
 
     Returns a mapping of output field name to a fresh list holding the
@@ -136,9 +236,12 @@ def _prepare_allowed_values(columns, defaults):
     ``integer`` columns, booleans for ``boolean`` columns; null, arrays
     and objects are never valid entries, and repeated entries (value
     equality, verbatim for strings) are refused. A processed default
-    outside the list is a configuration error even when no row needs it.
-    Raises ValueError naming ``allowed_values`` and the output field
-    before the input is read; the caller's schema is never mutated.
+    outside the list is a configuration error even when no row needs it;
+    when the column declares a ``value_map`` the default is judged after
+    its one mapping lookup (a filled default is itself mapped), so the
+    checked default is the mapped target. Raises ValueError naming
+    ``allowed_values`` and the output field before the input is read; the
+    caller's schema is never mutated.
     """
     allowed = {}
     for column in columns:
@@ -168,10 +271,15 @@ def _prepare_allowed_values(columns, defaults):
                     f"column {name!r} allowed_values entry {entry!r} is repeated")
             checked.append(entry)
         allowed[name] = checked
-        if name in defaults and defaults[name] not in checked:
-            raise ValueError(
-                f"column {name!r} default {defaults[name]!r} is not one of "
-                f"allowed_values {checked!r}")
+        if name in defaults:
+            effective_default = defaults[name]
+            column_map = value_maps.get(name)
+            if column_map is not None:
+                effective_default = _mapped_string(effective_default, column_map)
+            if effective_default not in checked:
+                raise ValueError(
+                    f"column {name!r} default {effective_default!r} is not one of "
+                    f"allowed_values {checked!r}")
     return allowed
 
 
@@ -409,7 +517,7 @@ def _prepare_required_when(columns):
     return required_when
 
 
-def _prepare_patterns(columns, defaults):
+def _prepare_patterns(columns, defaults, value_maps=frozenset()):
     """Validate the optional ``pattern`` regular expression of each column.
 
     Returns a mapping of output field name to the compiled expression; the
@@ -423,10 +531,12 @@ def _prepare_patterns(columns, defaults):
     configuration error. A processed ``default`` (already trimmed and, for
     an NFKC column, normalized) that does not match is a configuration
     error even when no row needs it, while an ``allowed_values`` entry
-    that fails the expression is not. Raises ValueError naming
-    ``pattern``, the output field and the offending value (the default
-    error also names ``default``) before the input is read; the caller's
-    schema is never mutated.
+    that fails the expression is not. When the column declares a
+    ``value_map`` the filled default is itself mapped once, so the
+    constraint is checked against the mapped target. Raises ValueError
+    naming ``pattern``, the output field and the offending value (the
+    default error also names ``default``) before the input is read; the
+    caller's schema is never mutated.
     """
     patterns = {}
     for column in columns:
@@ -449,10 +559,15 @@ def _prepare_patterns(columns, defaults):
                 f"column {name!r} pattern {pattern!r} is not a valid regular "
                 f"expression: {exc}") from None
         patterns[name] = compiled
-        if name in defaults and compiled.fullmatch(defaults[name]) is None:
-            raise ValueError(
-                f"column {name!r} default {defaults[name]!r} does not match "
-                f"pattern {pattern!r}")
+        if name in defaults:
+            effective_default = defaults[name]
+            column_map = value_maps.get(name)
+            if column_map is not None:
+                effective_default = _mapped_string(effective_default, column_map)
+            if compiled.fullmatch(effective_default) is None:
+                raise ValueError(
+                    f"column {name!r} default {effective_default!r} does not match "
+                    f"pattern {pattern!r}")
     return patterns
 
 
@@ -596,13 +711,14 @@ def _prepare_schema(schema):
     columns = schema["columns"]
     normalizing = _prepare_unicode_normalization(columns)
     casefolding = _prepare_casefold(columns)
+    value_maps = _prepare_value_maps(columns, normalizing, casefolding)
     defaults = _prepare_defaults(columns, normalizing, casefolding)
-    allowed = _prepare_allowed_values(columns, defaults)
+    allowed = _prepare_allowed_values(columns, defaults, value_maps)
     markers = _prepare_missing_values(columns)
     aliases = _prepare_boolean_aliases(columns)
     ranges = _prepare_ranges(columns, defaults)
     lte_fields = _prepare_lte_fields(columns)
-    patterns = _prepare_patterns(columns, defaults)
+    patterns = _prepare_patterns(columns, defaults, value_maps)
     sources = []
     for column in columns:
         name = column["name"]
@@ -623,7 +739,7 @@ def _prepare_schema(schema):
     # pre-existing configuration check (structure, per-column attributes
     # and sources) has passed.
     required_when = _prepare_required_when(columns)
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps
 
 
 def _prepare_field_list(fields, names, option):
@@ -992,7 +1108,7 @@ def _nfkc(value):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None, filter_in=None, filter_range=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1097,6 +1213,12 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                             slots[index].append(f"{name}: {exc}")
                             field_error_names.add(name)
                             continue
+                        if isinstance(converted, str) and name in value_maps:
+                            # One exact lookup over the processed keys on
+                            # the final string (a filled default is mapped
+                            # just like any other value); null stays null
+                            # and the target is never matched again.
+                            converted = _mapped_string(converted, value_maps[name])
                         enum_error = _enum_field_error(name, converted, allowed)
                         if enum_error is not None:
                             slots[index].append(enum_error)
@@ -1200,7 +1322,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None, filter_in=None, filter_range=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1267,6 +1389,13 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     slots[index].append(message)
                     field_error_names.add(name)
                     continue
+                if isinstance(converted, str) and name in value_maps:
+                    # One exact lookup over the processed keys on the
+                    # final string (a filled default is mapped just like
+                    # any other value); null stays null, a non-string
+                    # value keeps its type error and never reaches here,
+                    # and the target is never matched again.
+                    converted = _mapped_string(converted, value_maps[name])
                 enum_error = _enum_field_error(name, converted, allowed)
                 if enum_error is not None:
                     slots[index].append(enum_error)
