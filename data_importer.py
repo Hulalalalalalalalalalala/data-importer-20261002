@@ -67,13 +67,77 @@ def _prepare_casefold(columns):
     return folding
 
 
+def _prepare_value_maps(columns, normalizing, casefolding):
+    """Validate the optional per-column ``value_map`` attribute.
+
+    Returns a mapping of output field name to a fresh dict keyed by the
+    processed key text holding the processed target. The attribute must be
+    a non-empty object and may appear only on a ``string`` column; every
+    key and every mapped value must be a string. Each key and target is
+    put through the column's own string processing in its existing order
+    (trim; NFKC-normalize and re-trim for an NFKC column; then casefold
+    for a case-folding column), exactly like an ordinary cell value; a
+    key or target that processes to blank, or two keys that process to
+    the same text, is invalid even when they map to the same target.
+    Raises ValueError naming ``value_map``, the output field and the
+    offending value before the input is read; the caller's schema dicts
+    are never mutated.
+    """
+    value_maps = {}
+    for column in columns:
+        name, kind = column["name"], column["type"]
+        if "value_map" not in column:
+            continue
+        configured = column["value_map"]
+        if kind != "string":
+            raise ValueError(
+                f"column {name!r} value_map {configured!r} requires a string column")
+        if not isinstance(configured, dict) or not configured:
+            raise ValueError(
+                f"column {name!r} value_map {configured!r} must be a non-empty object")
+
+        def processed(text, role):
+            if not isinstance(text, str):
+                raise ValueError(
+                    f"column {name!r} value_map {role} {text!r} must be a string")
+            result = text.strip()
+            if not result:
+                raise ValueError(
+                    f"column {name!r} value_map {role} {text!r} must not be blank")
+            if name in normalizing:
+                result = _nfkc(result)
+                if not result:
+                    raise ValueError(
+                        f"column {name!r} value_map {role} {text!r} "
+                        "must not normalize to blank")
+            if name in casefolding:
+                result = result.casefold()
+            return result
+
+        normalized = {}
+        for key, target in configured.items():
+            processed_key = processed(key, "key")
+            processed_target = processed(target, "value")
+            if processed_key in normalized:
+                raise ValueError(
+                    f"column {name!r} value_map key {key!r} normalizes to a repeated "
+                    f"key {processed_key!r}")
+            normalized[processed_key] = processed_target
+        value_maps[name] = normalized
+    return value_maps
+
+
 def _prepare_defaults(columns, normalizing=frozenset(), casefolding=frozenset()):
     """Validate the optional target-typed ``default`` of each column.
 
     Returns a mapping of output field name to the processed default
     (string defaults are trimmed; a string column opting into NFKC also
     has its default NFKC-normalized and re-trimmed, and a string column
-    opting into case folding then has it casefolded, in that order). A
+    opting into case folding then has it casefolded, in that order). The
+    optional ``value_map`` is deliberately not applied here: a filled
+    default goes through the map exactly once at row time, just like any
+    other converted string; ``_prepare_schema`` builds a separate
+    mapped-default view for the ``allowed_values``/``pattern`` checks. A
     malformed default is a configuration error naming the default value
     and output field, raised before the input is read; the caller's
     schema dicts are never mutated. A normalized string default that
@@ -596,13 +660,24 @@ def _prepare_schema(schema):
     columns = schema["columns"]
     normalizing = _prepare_unicode_normalization(columns)
     casefolding = _prepare_casefold(columns)
+    value_maps = _prepare_value_maps(columns, normalizing, casefolding)
     defaults = _prepare_defaults(columns, normalizing, casefolding)
-    allowed = _prepare_allowed_values(columns, defaults)
+    # A string default whose processed text is a map key is finally
+    # emitted as the mapped target; the constraint checks below use that
+    # view. The default itself stays unmapped in ``defaults`` so the row
+    # pipeline applies the map exactly once (the filled default is
+    # mapped at row time, like every other converted string).
+    constraint_defaults = dict(defaults)
+    for name, default in defaults.items():
+        column_map = value_maps.get(name)
+        if column_map is not None and isinstance(default, str) and default in column_map:
+            constraint_defaults[name] = column_map[default]
+    allowed = _prepare_allowed_values(columns, constraint_defaults)
     markers = _prepare_missing_values(columns)
     aliases = _prepare_boolean_aliases(columns)
-    ranges = _prepare_ranges(columns, defaults)
+    ranges = _prepare_ranges(columns, constraint_defaults)
     lte_fields = _prepare_lte_fields(columns)
-    patterns = _prepare_patterns(columns, defaults)
+    patterns = _prepare_patterns(columns, constraint_defaults)
     sources = []
     for column in columns:
         name = column["name"]
@@ -623,7 +698,9 @@ def _prepare_schema(schema):
     # pre-existing configuration check (structure, per-column attributes
     # and sources) has passed.
     required_when = _prepare_required_when(columns)
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when
+    return (columns, sources, defaults, allowed, markers, aliases, ranges,
+            lte_fields, normalizing, patterns, casefolding, required_when,
+            value_maps)
 
 
 def _prepare_field_list(fields, names, option):
@@ -992,7 +1069,7 @@ def _nfkc(value):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None, filter_in=None, filter_range=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1097,6 +1174,18 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                             slots[index].append(f"{name}: {exc}")
                             field_error_names.add(name)
                             continue
+                        if converted is not None and name in value_maps:
+                            column_map = value_maps[name]
+                            if converted in column_map:
+                                # The map runs exactly once, on the final
+                                # converted string -- trimming, marker
+                                # handling, the empty/default flow, NFKC
+                                # normalization and case folding have all
+                                # happened already, and a filled default
+                                # reaches this point unmapped. The target
+                                # is never mapped or marker-matched again
+                                # and null passes through untouched.
+                                converted = column_map[converted]
                         enum_error = _enum_field_error(name, converted, allowed)
                         if enum_error is not None:
                             slots[index].append(enum_error)
@@ -1200,7 +1289,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None, filter_in=None, filter_range=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when, value_maps = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1267,6 +1356,17 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     slots[index].append(message)
                     field_error_names.add(name)
                     continue
+                if converted is not None and name in value_maps:
+                    column_map = value_maps[name]
+                    if converted in column_map:
+                        # Exactly one mapping on the converted string;
+                        # non-string JSON values never get here (they
+                        # return their ordinary type error above), null
+                        # passes through, and the target is neither mapped
+                        # nor marker-matched again. A filled default was
+                        # returned unmapped and takes its single mapping
+                        # here.
+                        converted = column_map[converted]
                 enum_error = _enum_field_error(name, converted, allowed)
                 if enum_error is not None:
                     slots[index].append(enum_error)

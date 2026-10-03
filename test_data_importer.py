@@ -5692,5 +5692,340 @@ class CasefoldTests(unittest.TestCase):
                              "code\nstrasse\nstrasse\nstrasse\nstrasse\n")
 
 
+class ValueMapTests(unittest.TestCase):
+    """Optional per-column ``value_map`` text merging for string columns."""
+
+    def schema(self, **overrides):
+        column = {"name": "code", "type": "string", "casefold": True,
+                  "default": "YES",
+                  "value_map": {"yes": "ok", "ok": "done"}}
+        column.update(overrides)
+        return {"columns": [column]}
+
+    def write_csv(self, directory, text):
+        path = Path(directory) / "data.csv"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_jsonl(self, directory, values, key="code"):
+        path = Path(directory) / "data.jsonl"
+        path.write_text("".join(json.dumps({key: value}, ensure_ascii=False) + "\n"
+                                for value in values), encoding="utf-8")
+        return path
+
+    def write_sample_pair(self, directory):
+        # " YES " folds to the "yes" key -> "ok"; "ok" hits the second
+        # key -> "done"; the empty value fills the processed default
+        # "yes" and then maps once -> "ok".
+        csv_path = self.write_csv(directory, 'code\n YES \nok\n""\n')
+        jsonl_path = self.write_jsonl(
+            directory, [" YES ", "ok", None])
+        return (("csv", csv_path), ("jsonl", jsonl_path))
+
+    def test_fixed_sample_csv_and_jsonl(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(), duplicate_by=["code"])
+                self.assertEqual(
+                    [record["code"] for record in result["records"]],
+                    ["ok", "done", "ok"])
+                self.assertEqual((result["accepted"], result["rejected"]), (3, 0))
+                self.assertEqual(result["duplicates"], [
+                    {"key": {"code": "ok"}, "record_numbers": [1, 3]},
+                ])
+
+    def test_mapping_runs_once_without_chaining(self):
+        # "ok" maps to "done"; even though "done" is itself a key, the
+        # result is never matched against the map a second time.
+        schema = {"columns": [{"name": "code", "type": "string",
+                               "value_map": {"ok": "done", "done": "x"}}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nok\ndone\n")
+            jsonl_path = self.write_jsonl(directory, ["ok", "done"])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                self.assertEqual([r["code"] for r in normalize(path, schema)["records"]],
+                                 ["done", "x"])
+
+    def test_filled_default_maps_once_and_null_passes_through(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                records = normalize(path, self.schema())["records"]
+                # the third record is the filled default (CSV quoted
+                # empty cell, JSONL null), mapped to "ok"; an optional
+                # column with no default still emits null untouched.
+                self.assertEqual([r["code"] for r in records],
+                                 ["ok", "done", "ok"])
+            optional = {"columns": [{"name": "code", "type": "string",
+                                     "value_map": {"ok": "done"}}]}
+            csv_path = self.write_csv(directory, 'code\nok\n""\n')
+            jsonl_path = self.write_jsonl(directory, ["ok", None])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                self.assertEqual(normalize(path, optional)["records"],
+                                 [{"code": "done"}, {"code": None}])
+
+    def test_mapped_text_is_not_marker_matched_again(self):
+        # A marker spelling only equal to the map target: the mapped
+        # result keeps the target instead of following the missing flow.
+        schema = {"columns": [{"name": "f", "type": "string",
+                               "missing_values": ["done"],
+                               "default": "FILL",
+                               "value_map": {"ok": "done"}}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "f\nok\n")
+            self.assertEqual(normalize_csv(csv_path, schema)["records"],
+                             [{"f": "done"}])
+            jsonl_path = self.write_jsonl(directory, ["ok"], key="f")
+            self.assertEqual(normalize_jsonl(jsonl_path, schema)["records"],
+                             [{"f": "done"}])
+
+    def test_allowed_values_checks_the_final_value(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(allowed_values=["ok"]))
+                # only the second row, whose target is "done", is rejected
+                self.assertEqual([r["code"] for r in result["records"]],
+                                 ["ok", "ok"])
+                self.assertEqual(result["rejected"], 1)
+                self.assertEqual(result["errors"][0]["row"],
+                                 3 if fmt == "csv" else 2)
+                self.assertIn("allowed_values",
+                              result["errors"][0]["errors"][0])
+
+    def test_pattern_checks_the_final_value(self):
+        schema = self.schema(pattern="ok")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, schema)
+                self.assertEqual([r["code"] for r in result["records"]],
+                                 ["ok", "ok"])
+                self.assertEqual(result["rejected"], 1)
+                self.assertIn("pattern", result["errors"][0]["errors"][0])
+
+    def test_unused_or_unhit_target_need_not_satisfy_constraints(self):
+        # The "bad" target violates allowed_values, but it is never
+        # checked at configuration time: the mapped default lands on
+        # "ok", a row hitting the "no" key is rejected with the ordinary
+        # field error, and all other rows are accepted.
+        schema = self.schema(
+            allowed_values=["ok"],
+            value_map={"yes": "ok", "no": "bad"})
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'code\n YES \nno\n""\n')
+            jsonl_path = self.write_jsonl(directory, [" YES ", "no", None])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                result = normalize(path, schema)
+                self.assertEqual([r["code"] for r in result["records"]],
+                                 ["ok", "ok"])
+                self.assertEqual(result["rejected"], 1)
+                self.assertIn("allowed_values",
+                              result["errors"][0]["errors"][0])
+
+    def test_mapped_default_violating_constraint_is_configuration_error(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        for attribute, bad in (
+                ("allowed_values", ["ok"]),
+                ("pattern", "ok")):
+            column = {"name": "code", "type": "string", "casefold": True,
+                      "default": "YES",
+                      "value_map": {"yes": "bad"}, attribute: bad}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, {"columns": [column]})
+                message = str(caught.exception)
+                self.assertIn("default", message)
+                self.assertIn("code", message)
+                self.assertIn(attribute, message)
+                # the error names the mapped final default value
+                self.assertIn("bad", message)
+
+    def test_keys_and_targets_follow_the_column_string_processing(self):
+        # NFKC full-width key and target process to ASCII before matching.
+        schema = {"columns": [{"name": "code", "type": "string",
+                               "unicode_normalization": "NFKC",
+                               "value_map": {"Ａ": "Ｂ"}}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nA\nＡ\n")
+            self.assertEqual(normalize_csv(csv_path, schema)["records"],
+                             [{"code": "B"}, {"code": "B"}])
+            jsonl_path = self.write_jsonl(directory, ["A", "Ａ"])
+            self.assertEqual(normalize_jsonl(jsonl_path, schema)["records"],
+                             [{"code": "B"}, {"code": "B"}])
+
+    def test_jsonl_non_string_keeps_type_error(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "data.jsonl"
+            path.write_text('{"code": 4}\n{"code": ["ok"]}\n', encoding="utf-8")
+            result = normalize_jsonl(path, self.schema())
+        self.assertEqual(result["rejected"], 2)
+        self.assertTrue(all(row["errors"] == ["code: expected string"]
+                            for row in result["errors"]))
+
+    def test_filter_dedup_and_export_use_final_values(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(
+                    path, self.schema(),
+                    filter_eq={"field": "code", "value": "ok"},
+                    deduplicate_by=["code"])
+                # filter keeps the two final "ok" rows (the "done" row is
+                # the one filtered record), then keep-first dedup drops
+                # the second of the equal final values.
+                self.assertEqual([r["code"] for r in result["records"]],
+                                 ["ok"])
+                self.assertEqual(result["filtered"], 1)
+                self.assertEqual(result["deduplicated"], 1)
+
+    def test_invalid_attribute_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        # Attribute-level problems: the message carries the whole
+        # attribute value verbatim.
+        for value in ({}, None, [], "x", ["a"]):
+            schema = {"columns": [{"name": "f", "type": "string",
+                                   "value_map": value}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("value_map", message, value)
+                self.assertIn("f", message, value)
+                self.assertIn(repr(value), message, value)
+        # Entry-level problems: the message names the offending key or
+        # value, plus value_map and the output field.
+        entry_bad = [({"a": 3}, "3"), ({"a": None}, "None"),
+                     ({"a": ["b"]}, "['b']"), ({1: "b"}, "1"),
+                     ({"a": ""}, "''"), ({"a": "   "}, "'   '"),
+                     ({" ": "b"}, "' '"), ({"  ": "b"}, "'  '")]
+        for value, offending in entry_bad:
+            schema = {"columns": [{"name": "f", "type": "string",
+                                   "value_map": value}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("value_map", message, value)
+                self.assertIn("f", message, value)
+                self.assertIn(offending, message, value)
+        # two keys processing to the same text are invalid even when the
+        # targets agree (raw whitespace keys, and folding collisions).
+        for value in ({" ": "b", "\t": "c"},
+                      {"YES": "ok", "yes": "done"},
+                      {"YES": "ok", "yes": "ok"}):
+            schema = {"columns": [{"name": "f", "type": "string",
+                                   "casefold": True, "value_map": value}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("value_map", message, value)
+                self.assertIn("f", message, value)
+        for kind in ("integer", "boolean"):
+            schema = {"columns": [{"name": "f", "type": kind,
+                                   "value_map": {"a": "b"}}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("value_map", message)
+                self.assertIn("f", message)
+        # a key whose NFKC normalization collapses to blank is refused
+        schema = {"columns": [{"name": "f", "type": "string",
+                               "unicode_normalization": "NFKC",
+                               "value_map": {"　": "b"}}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        self.assertIn("value_map", str(caught.exception))
+
+    def test_structure_check_still_runs_first(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [{"name": "f", "type": "nope",
+                               "value_map": {"a": "b"}}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        message = str(caught.exception)
+        self.assertIn("schema", message)
+        self.assertNotIn("value_map", message)
+
+    def test_schema_dict_is_never_mutated(self):
+        import copy
+        schema = self.schema()
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\nok\n")
+            normalize_csv(csv_path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_omitting_value_map_keeps_old_behavior(self):
+        column = {"name": "f", "type": "string", "casefold": True}
+        schema = {"columns": [column]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "f\nYES\nok\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"f": "yes"}, {"f": "ok"}])
+        self.assertEqual(result["rejected"], 0)
+
+    def test_cli_bad_value_map_exit_two_keeps_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_csv(directory, "code\nok\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(
+                {"columns": [{"name": "code", "type": "string",
+                              "value_map": {"ok": 1}}]}),
+                encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("value_map", payload["error"])
+            self.assertIn("code", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+    def test_cli_maps_and_exports_both_formats(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(
+                json.dumps(self.schema(), ensure_ascii=False), encoding="utf-8")
+            for fmt, source in self.write_sample_pair(directory):
+                output = Path(directory) / f"out-{fmt}.jsonl"
+                errors = Path(directory) / f"err-{fmt}.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"),
+                           str(source), "--schema", str(schema_path),
+                           "--output", str(output), "--errors", str(errors),
+                           "--format", fmt]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                summary = json.loads(run.stdout)
+                self.assertEqual((summary["accepted"], summary["rejected"]),
+                                 (3, 0))
+                records = [json.loads(line)
+                           for line in output.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual([r["code"] for r in records],
+                                 ["ok", "done", "ok"])
+            output = Path(directory) / "out.csv"
+            errors = Path(directory) / "err.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"),
+                       str(self.write_sample_pair(directory)[0][1]),
+                       "--schema", str(schema_path),
+                       "--output", str(output), "--errors", str(errors),
+                       "--format", "csv", "--output-format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"),
+                             "code\nok\ndone\nok\n")
+
+
 if __name__ == "__main__":
     unittest.main()
