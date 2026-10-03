@@ -335,6 +335,76 @@ def _prepare_lte_fields(columns):
     return lte_fields
 
 
+def _required_when_errors(record, field_errors, required_when):
+    """Check every declared ``required_when`` condition over final values.
+
+    Runs after structure checks, marker matching, default filling, type
+    conversion, enum, range, pattern and lte_field checks. A condition is
+    skipped when either participating field already has a required, type,
+    enum, range or pattern error; the original errors are kept and every
+    other condition is still checked. Conditions are evaluated in schema
+    column order and returned as ``(name, message)`` pairs so the caller
+    can file each error under its declaring column's position; a
+    violation names ``required_when``, both output names and the boolean
+    ``true``. Only a final ``True`` on the condition column triggers the
+    rule (``False`` and null never do), and only a final null on the
+    declaring column violates it -- ``0`` and ``False`` count as values.
+    """
+    errors = []
+    for name, target in required_when:
+        if name in field_errors or target in field_errors:
+            continue
+        if record.get(target) is not True:
+            continue
+        if record.get(name) is None:
+            errors.append((
+                name,
+                f"{name}: value is null while required_when {target!r} is true"))
+    return errors
+
+
+def _prepare_required_when(columns):
+    """Validate the optional ``required_when`` reference of each column.
+
+    Returns a list of ``(name, target)`` pairs in schema column order, one
+    entry per declaring column. The attribute may appear on a column of
+    any type and must be a non-blank string naming a ``boolean`` column by
+    its output name (the reference is case-sensitive, never trimmed, and
+    source aliases are not recognized); a non-string, a blank string, an
+    unknown field, a self reference, or a non-boolean target is a
+    configuration error. Raises ValueError naming ``required_when``, the
+    output field and the attribute value before the input is read; the
+    caller's schema is never mutated.
+    """
+    by_name = {column["name"]: column for column in columns}
+    required_when = []
+    for column in columns:
+        name = column["name"]
+        if "required_when" not in column:
+            continue
+        target = column["required_when"]
+        if not isinstance(target, str):
+            raise ValueError(
+                f"column {name!r} required_when {target!r} must be a string naming "
+                "a boolean column")
+        if not target.strip():
+            raise ValueError(
+                f"column {name!r} required_when {target!r} must be a non-blank string")
+        if target == name:
+            raise ValueError(
+                f"column {name!r} required_when {target!r} must not reference "
+                "the column itself")
+        if target not in by_name:
+            raise ValueError(
+                f"column {name!r} required_when {target!r} is not a schema column name")
+        if by_name[target]["type"] != "boolean":
+            raise ValueError(
+                f"column {name!r} required_when {target!r} must reference a "
+                "boolean column")
+        required_when.append((name, target))
+    return required_when
+
+
 def _prepare_patterns(columns, defaults):
     """Validate the optional ``pattern`` regular expression of each column.
 
@@ -545,7 +615,8 @@ def _prepare_schema(schema):
         if origin in owners:
             raise ValueError(f"columns {owners[origin]!r} and {name!r} share source {origin!r}")
         owners[origin] = name
-    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding
+    required_when = _prepare_required_when(columns)
+    return columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when
 
 
 def _prepare_field_list(fields, names, option):
@@ -836,7 +907,7 @@ def _nfkc(value):
 
 def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                   deduplicate_by=None, filter_in=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -959,6 +1030,9 @@ def normalize_csv(source, schema, duplicate_by=None, filter_eq=None,
                     for name, message in _lte_field_errors(
                             record, field_error_names, lte_fields):
                         slots[column_index[name]].append(message)
+                    for name, message in _required_when_errors(
+                            record, field_error_names, required_when):
+                        slots[column_index[name]].append(message)
                     row_errors = [message for slot in slots for message in slot]
                 if row_errors:
                     errors.append({"row": start_line, "errors": row_errors})
@@ -1035,7 +1109,7 @@ def _convert_jsonl_value(column, value, defaults, markers, aliases,
 
 def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     deduplicate_by=None, filter_in=None):
-    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding = _prepare_schema(schema)
+    columns, sources, defaults, allowed, markers, aliases, ranges, lte_fields, normalizing, patterns, casefolding, required_when = _prepare_schema(schema)
     names = [column["name"] for column in columns]
     column_index = {name: index for index, name in enumerate(names)}
     duplicate_fields = _prepare_duplicate_by(duplicate_by, names)
@@ -1119,6 +1193,9 @@ def normalize_jsonl(source, schema, duplicate_by=None, filter_eq=None,
                     record[name] = converted
             for name, message in _lte_field_errors(
                     record, field_error_names, lte_fields):
+                slots[column_index[name]].append(message)
+            for name, message in _required_when_errors(
+                    record, field_error_names, required_when):
                 slots[column_index[name]].append(message)
             row_errors = [message for slot in slots for message in slot]
             if row_errors:
