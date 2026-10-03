@@ -6068,5 +6068,312 @@ class ValueMapTests(unittest.TestCase):
                              "code\nok\ndone\nok\n")
 
 
+class CollapseWhitespaceTests(unittest.TestCase):
+    """Optional internal-whitespace collapsing for ``string`` columns."""
+
+    def schema(self, **overrides):
+        column = {"name": "code", "type": "string", "collapse_whitespace": True}
+        column.update(overrides)
+        return {"columns": [column]}
+
+    def write_csv(self, directory, text):
+        path = Path(directory) / "data.csv"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_jsonl(self, directory, values, key="code"):
+        path = Path(directory) / "data.jsonl"
+        path.write_text("".join(json.dumps({key: value}, ensure_ascii=False) + "\n"
+                                for value in values), encoding="utf-8")
+        return path
+
+    def write_sample_pair(self, directory):
+        # "A  B", a tab between A and B, and a newline between A and B
+        # (a quoted CSV field, an escaped JSONL newline).
+        csv_path = self.write_csv(directory, 'code\nA  B\nA\tB\n"A\nB"\n')
+        jsonl_path = self.write_jsonl(directory, ["A  B", "A\tB", "A\nB"])
+        return (("csv", csv_path), ("jsonl", jsonl_path))
+
+    def test_fixed_sample_csv_and_jsonl(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(), duplicate_by=["code"])
+                self.assertEqual(result["records"], [{"code": "A B"}] * 3)
+                self.assertEqual((result["accepted"], result["rejected"]), (3, 0))
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["duplicates"], [
+                    {"key": {"code": "A B"}, "record_numbers": [1, 2, 3]},
+                ])
+
+    def test_dedup_keeps_first_of_collapsed_group(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, self.schema(), deduplicate_by=["code"])
+                self.assertEqual(result["records"], [{"code": "A B"}])
+                self.assertEqual((result["accepted"], result["deduplicated"],
+                                  result["rejected"]), (1, 2, 0))
+
+    def test_filter_eq_text_stays_verbatim(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                collapsed = normalize(path, self.schema(),
+                                      filter_eq={"field": "code", "value": "A B"})
+                self.assertEqual((collapsed["accepted"], collapsed["filtered"],
+                                  collapsed["rejected"]), (3, 0, 0))
+                # the filter value is never collapsed: the pre-collapse
+                # spelling matches nothing once the column emits "A B".
+                verbatim = normalize(path, self.schema(),
+                                     filter_eq={"field": "code", "value": "A  B"})
+                self.assertEqual((verbatim["accepted"], verbatim["filtered"],
+                                  verbatim["rejected"]), (0, 3, 0))
+
+    def test_whitespace_range_and_zero_width_space(self):
+        # tabs, CR/LF and the Unicode space separators (here U+00A0) all
+        # collapse; U+200B (zero-width space) is not whitespace and stays.
+        schema = self.schema()
+        rows = ['"A\r\n\tB"', '"A\u00a0B"', '"A\u200b  B"']
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "code\n" + "\n".join(rows) + "\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"code": "A B"}, {"code": "A B"},
+                                             {"code": "A\u200b B"}])
+
+    def test_error_rows_keep_original_physical_line_numbers(self):
+        schema = self.schema(allowed_values=["A B"])
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            # the multiline record occupies physical lines 2-3, so the
+            # failing record starts on line 4
+            csv_path = self.write_csv(directory, 'code\n"A\nB"\nx\n')
+            result = normalize_csv(csv_path, schema)
+            jsonl_path = self.write_jsonl(directory, ["A\nB", "x"])
+            jsonl_result = normalize_jsonl(jsonl_path, schema)
+        self.assertEqual(result["records"], [{"code": "A B"}])
+        self.assertEqual([row["row"] for row in result["errors"]], [4])
+        self.assertIn("allowed_values", result["errors"][0]["errors"][0])
+        self.assertEqual(jsonl_result["records"], [{"code": "A B"}])
+        self.assertEqual([row["row"] for row in jsonl_result["errors"]], [2])
+
+    def test_collapsed_default_is_the_filled_value(self):
+        schema = self.schema(default=" A  B ")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'code\n""\n')
+            jsonl_path = self.write_jsonl(directory, [None])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                self.assertEqual(normalize(path, schema)["records"],
+                                 [{"code": "A B"}])
+
+    def test_default_is_validated_after_collapsing(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        # the collapsed default is not in the verbatim enum
+        schema = self.schema(default="A  B", allowed_values=["A  B"])
+        for normalize in (normalize_csv, normalize_jsonl):
+            with self.assertRaises(ValueError) as caught:
+                normalize(missing, schema)
+            message = str(caught.exception)
+            self.assertIn("default", message)
+            self.assertIn("code", message)
+            self.assertIn("allowed_values", message)
+        # the collapsed default fails the declared pattern
+        schema = self.schema(default="A  B", pattern="\\S+")
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        message = str(caught.exception)
+        self.assertIn("default", message)
+        self.assertIn("pattern", message)
+
+    def test_pattern_and_enum_see_the_collapsed_text(self):
+        schema = self.schema(pattern="A B", allowed_values=["A B"])
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                result = normalize(path, schema)
+                self.assertEqual(result["records"], [{"code": "A B"}] * 3)
+                self.assertEqual(result["rejected"], 0)
+
+    def test_markers_match_once_before_collapsing(self):
+        # Marker "A  B" matches the verbatim trimmed input before
+        # collapsing; the already-collapsed input "A B" never becomes
+        # marker text and is not marker-matched again.
+        schema = {"columns": [{"name": "f", "type": "string",
+                               "missing_values": ["A  B"],
+                               "collapse_whitespace": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "f\nA  B\nA B\n")
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"f": None}, {"f": "A B"}])
+        # a filled default never participates in marker matching, even
+        # when its collapsed text equals a marker.
+        schema = {"columns": [{"name": "f", "type": "string",
+                               "missing_values": ["A B"],
+                               "default": "A  B",
+                               "collapse_whitespace": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'f\n""\n')
+            result = normalize_csv(csv_path, schema)
+        self.assertEqual(result["records"], [{"f": "A B"}])
+
+    def test_value_map_keys_and_targets_are_collapsed(self):
+        schema = self.schema(value_map={"x  y": "a  b"}, default=" x  y ")
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, 'code\nx y\n""\n')
+            jsonl_path = self.write_jsonl(directory, ["x\ty", None])
+            for normalize, path in ((normalize_csv, csv_path),
+                                    (normalize_jsonl, jsonl_path)):
+                self.assertEqual(normalize(path, schema)["records"],
+                                 [{"code": "a b"}] * 2)
+
+    def test_value_map_keys_colliding_after_collapse_are_refused(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        # keys that differ only in a whitespace run collide after
+        # collapsing, even when both map to the same target
+        for value in ({"a  b": "x", "a b": "y"}, {"a  b": "x", "a b": "x"}):
+            schema = self.schema(value_map=value)
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("value_map", message)
+                self.assertIn("code", message)
+                self.assertIn("'a b'", message)
+
+    def test_jsonl_non_string_keeps_type_error(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "data.jsonl"
+            path.write_text('{"code": 4}\n{"code": ["x"]}\n', encoding="utf-8")
+            result = normalize_jsonl(path, self.schema())
+        self.assertEqual(result["rejected"], 2)
+        self.assertTrue(all(row["errors"] == ["code: expected string"]
+                            for row in result["errors"]))
+
+    def test_false_or_missing_attribute_keeps_old_behavior(self):
+        for attribute in ({}, {"collapse_whitespace": False}):
+            column = {"name": "f", "type": "string",
+                      "allowed_values": ["A  B"], **attribute}
+            schema = {"columns": [column]}
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                csv_path = self.write_csv(directory, "f\nA  B\nA B\n")
+                result = normalize_csv(csv_path, schema)
+            self.assertEqual(result["records"], [{"f": "A  B"}])
+            self.assertEqual(result["rejected"], 1)
+
+    def test_field_source_header_and_key_names_are_not_collapsed(self):
+        schema = {"columns": [{"name": "code", "type": "string",
+                               "source": "Co  de", "collapse_whitespace": True}]}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            csv_path = self.write_csv(directory, "Co  de\nA  B\n")
+            self.assertEqual(normalize_csv(csv_path, schema)["records"],
+                             [{"code": "A B"}])
+            jsonl_path = self.write_jsonl(directory, ["A  B"], key="Co  de")
+            self.assertEqual(normalize_jsonl(jsonl_path, schema)["records"],
+                             [{"code": "A B"}])
+
+    def test_invalid_attribute_raises_before_reading(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        bad_values = ["true", "false", "yes", "", 0, 1, None, [True]]
+        for value in bad_values:
+            schema = {"columns": [{"name": "f", "type": "string",
+                                   "collapse_whitespace": value}]}
+            for normalize in (normalize_csv, normalize_jsonl):
+                with self.assertRaises(ValueError) as caught:
+                    normalize(missing, schema)
+                message = str(caught.exception)
+                self.assertIn("collapse_whitespace", message, value)
+                self.assertIn("f", message, value)
+                self.assertIn(repr(value), message, value)
+        for kind in ("integer", "boolean"):
+            for value in (True, False):
+                schema = {"columns": [{"name": "f", "type": kind,
+                                       "collapse_whitespace": value}]}
+                for normalize in (normalize_csv, normalize_jsonl):
+                    with self.assertRaises(ValueError) as caught:
+                        normalize(missing, schema)
+                    message = str(caught.exception)
+                    self.assertIn("collapse_whitespace", message)
+                    self.assertIn("f", message)
+                    self.assertIn(repr(value), message)
+
+    def test_structure_check_still_runs_first(self):
+        missing = ROOT / "samples" / "does-not-exist.csv"
+        schema = {"columns": [{"name": "f", "type": "nope",
+                               "collapse_whitespace": "x"}]}
+        with self.assertRaises(ValueError) as caught:
+            normalize_csv(missing, schema)
+        message = str(caught.exception)
+        self.assertIn("schema", message)
+        self.assertNotIn("collapse_whitespace", message)
+
+    def test_schema_dict_is_never_mutated(self):
+        import copy
+        schema = self.schema(default="A  B", value_map={"x  y": "z"})
+        snapshot = copy.deepcopy(schema)
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            for fmt, path in self.write_sample_pair(directory):
+                normalize = normalize_csv if fmt == "csv" else normalize_jsonl
+                normalize(path, schema)
+        self.assertEqual(schema, snapshot)
+
+    def test_cli_bad_attribute_exit_two_keeps_outputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            source = self.write_csv(directory, "code\nx\n")
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(json.dumps(
+                {"columns": [{"name": "code", "type": "string",
+                              "collapse_whitespace": "yes"}]}),
+                encoding="utf-8")
+            output, errors = Path(directory) / "data.jsonl", Path(directory) / "errors.jsonl"
+            output.write_text("keep me\n", encoding="utf-8")
+            command = [sys.executable, str(ROOT / "data_importer.py"), str(source),
+                       "--schema", str(schema_path), "--output", str(output),
+                       "--errors", str(errors), "--format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertIn("collapse_whitespace", payload["error"])
+            self.assertIn("code", payload["error"])
+            self.assertIn("yes", payload["error"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse(errors.exists())
+
+    def test_cli_collapses_and_exports_both_input_formats(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            schema_path = Path(directory) / "schema.json"
+            schema_path.write_text(
+                json.dumps(self.schema(), ensure_ascii=False), encoding="utf-8")
+            for fmt, source in self.write_sample_pair(directory):
+                output = Path(directory) / f"out-{fmt}.jsonl"
+                errors = Path(directory) / f"err-{fmt}.jsonl"
+                command = [sys.executable, str(ROOT / "data_importer.py"),
+                           str(source), "--schema", str(schema_path),
+                           "--output", str(output), "--errors", str(errors),
+                           "--format", fmt, "--duplicate-by", "code"]
+                run = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                summary = json.loads(run.stdout)
+                self.assertEqual(summary["accepted"], 3)
+                self.assertEqual(summary["rejected"], 0)
+                self.assertEqual(summary["duplicates"], [
+                    {"key": {"code": "A B"}, "record_numbers": [1, 2, 3]}])
+                records = [json.loads(line)
+                           for line in output.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(records, [{"code": "A B"}] * 3)
+            # the CSV records export carries the same collapsed text
+            output = Path(directory) / "out.csv"
+            errors = Path(directory) / "err.jsonl"
+            command = [sys.executable, str(ROOT / "data_importer.py"),
+                       str(self.write_sample_pair(directory)[0][1]),
+                       "--schema", str(schema_path),
+                       "--output", str(output), "--errors", str(errors),
+                       "--format", "csv", "--output-format", "csv"]
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"),
+                             "code\nA B\nA B\nA B\n")
+
+
 if __name__ == "__main__":
     unittest.main()
